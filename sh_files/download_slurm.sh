@@ -3,6 +3,7 @@
 #SBATCH --output=logs/download/era5_%j.out
 #SBATCH --error=logs/download/era5_%j.err
 #SBATCH --partition=defq
+#SBATCH --account=iu_0104
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
