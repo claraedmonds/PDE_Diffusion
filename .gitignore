@@ -185,3 +185,4 @@ notebooks/*
 
 # Hide databases
 *.db
+.venv
