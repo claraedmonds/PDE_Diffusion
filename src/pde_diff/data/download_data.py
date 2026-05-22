@@ -2,13 +2,14 @@
 1. Have an account and log in
 2. Go to the data page and accept Terms of Use: https://cds.climate.copernicus.eu/datasets/reanalysis-era5-pressure-levels?tab=download
 3. Copy the api url and key from this page: https://cds.climate.copernicus.eu/how-to-api
-4. Create a file called ".cdsapirc" containing the url and key in ones home/user folder. The file should look like this:
+4. Create a file called ".cdsapirc" containing the url and key in ones home/user folder. The file should have two lines.
+5. You may be missing eccodes and cfgrib, which are needed to read the grib files. You can install them using brew install eccodes and pip install cfgrib. 
 """
 import os
 import cdsapi
 import xarray as xr
 
-def download_era5_data(months: list[str]=["09"], days: list[str]=[str(i).zfill(2) for i in range(1,32)], test_mode: bool=False, full: bool=False):
+def download_era5_data(months: list[str]=["01","02","12"], days: list[str]=[str(i).zfill(2) for i in range(1,32)], test_mode: bool=False, full: bool=False):
     dataset = "reanalysis-era5-pressure-levels"
     request = {
         "product_type": ["reanalysis"],
@@ -19,7 +20,7 @@ def download_era5_data(months: list[str]=["09"], days: list[str]=[str(i).zfill(2
             "temperature",
             "geopotential"
         ],
-        "year": ["2024"],
+        "year": [ "2015", "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024"],
         "month": months,
         "day": days,
         "time": [
@@ -62,4 +63,3 @@ def download_era5_data(months: list[str]=["09"], days: list[str]=[str(i).zfill(2
 
 if __name__ == "__main__":
     download_era5_data(test_mode=False)
-    download_era5_data(months=["10"], days=["01","02"], test_mode=True)

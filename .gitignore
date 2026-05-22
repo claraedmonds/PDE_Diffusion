@@ -182,7 +182,6 @@ models/*
 data/*
 reports/figures/*
 notebooks/*
-*.sh
 
 # Hide databases
 *.db
