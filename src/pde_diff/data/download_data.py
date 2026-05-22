@@ -9,8 +9,11 @@ import os
 import cdsapi
 import xarray as xr
 
-def download_era5_data(months: list[str]=["01","02","12"], days: list[str]=[str(i).zfill(2) for i in range(1,32)], test_mode: bool=False, full: bool=False):
+ALL_YEARS = ["2015", "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024"]
+
+def download_era5_data(months: list[str]=["01","02","12"], days: list[str]=[str(i).zfill(2) for i in range(1,32)], test_mode: bool=False, full: bool=False, year: str | None=None):
     dataset = "reanalysis-era5-pressure-levels"
+    years = [year] if year else ALL_YEARS
     request = {
         "product_type": ["reanalysis"],
         "variable": [
@@ -20,7 +23,7 @@ def download_era5_data(months: list[str]=["01","02","12"], days: list[str]=[str(
             "temperature",
             "geopotential"
         ],
-        "year": [ "2015", "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024"],
+        "year": years,
         "month": months,
         "day": days,
         "time": [
@@ -40,7 +43,8 @@ def download_era5_data(months: list[str]=["01","02","12"], days: list[str]=[str(
     if not full:
         request["area"]=[70, -180, 46, 180]  # North, West, South, East
 
-    grib_file = "./data/era5/era5.grib"
+    year_suffix = f"_{year}" if year else ""
+    grib_file = f"./data/era5/era5{year_suffix}.grib"
     os.makedirs(os.path.dirname(grib_file), exist_ok=True)
 
     client = cdsapi.Client()
@@ -48,18 +52,22 @@ def download_era5_data(months: list[str]=["01","02","12"], days: list[str]=[str(
     print(f"Downloaded ERA5 data to {grib_file}")
 
     ds = xr.open_dataset(grib_file, engine='cfgrib')
-    save_path = './data/era5/zarr'
+    save_path = f'./data/era5/zarr{year_suffix}'
     if test_mode:
         save_path += "_test"
     if full:
         save_path += "_full"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    ds.to_zarr(save_path,mode="w")
+    ds.to_zarr(save_path, mode="w")
     print(f"Converted GRIB file to Zarr format at {save_path}")
 
-    #delete the grib file to save space
     os.remove(grib_file)
     print(f"Deleted temporary GRIB file {grib_file}")
 
 if __name__ == "__main__":
-    download_era5_data(test_mode=False)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--year", type=str, default=None, help="Single year to download (e.g. 2015). Omit to download all years.")
+    parser.add_argument("--full", action="store_true", help="Download global data (no area crop).")
+    args = parser.parse_args()
+    download_era5_data(year=args.year, full=args.full)
