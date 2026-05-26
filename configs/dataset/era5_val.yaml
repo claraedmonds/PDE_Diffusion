@@ -9,7 +9,7 @@ dims:
   y: 32
   input_dims: 53
   output_dims: 15
-train: true
+train: false
 atmospheric_features:
   - 'u'
   - 'v'
@@ -19,10 +19,10 @@ atmospheric_features:
 
 single_features: []
 static_features: []
-min_year: 2015
-max_year: 2021
+min_year: 2022
+max_year: 2022
 time_step: 1
 
-"lon_range": null # Data is full range
-"lat_range": null # Already subsampled to [70, 46]
+"lon_range": null
+"lat_range": null
 "downsample_factor": 3

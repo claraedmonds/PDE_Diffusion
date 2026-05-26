@@ -113,7 +113,12 @@ class ERA5Dataset(Dataset):
                         E.g. 12h steps correspond to time_step = 2 in a 6h dataset. Defaults to 2.
         """
         super().__init__()
-        self.data = xr.open_zarr(cfg.path, chunks={})
+        
+        import glob, xarray as xr
+        paths = sorted(glob.glob(cfg.path))
+        if not paths:
+            raise FileNotFoundError(f"No zarr stores found at {cfg.path}")
+        self.data = xr.concat([xr.open_zarr(p, chunks={}) for p in paths], dim="time")
 
         # Downsample longitude and latitude
         downsample_factor = cfg.get("downsample_factor", 2)  # Keep every 2nd grid point
@@ -124,6 +129,9 @@ class ERA5Dataset(Dataset):
             )
             print(f"Downsampled data by a factor of {downsample_factor}.")
         self.max_year = cfg.max_year
+        self.min_year = cfg.get("min_year", None)
+        years = self.data["time.year"].values
+        self._start_idx = int(sum(years < self.min_year)) if self.min_year else 0
 
         # Subset longitude and latitude
         lon_range = cfg.get("lon_range", None)  # Example: [0, 50]
@@ -207,11 +215,16 @@ class ERA5Dataset(Dataset):
         return clock_input_data
 
     def __len__(self):
-        return sum(self.data["time.year"].values <= self.max_year) - 2 * self.time_step
+        years = self.data["time.year"].values
+        mask = years <= self.max_year
+        if self.min_year:
+            mask = mask & (years >= self.min_year)
+        return int(sum(mask)) - 2 * self.time_step
 
     def __getitem__(self, item):
-        ds_conditionals = self.data.isel(time=[item, item + self.time_step])
-        ds_state = self.data.isel(time=item + 2 * self.time_step)
+        idx = item + self._start_idx
+        ds_conditionals = self.data.isel(time=[idx, idx + self.time_step])
+        ds_state = self.data.isel(time=idx + 2 * self.time_step)
 
         # Load inputs data
         ds_conditionals_atm = (
@@ -330,11 +343,16 @@ class ERA5DatasetTest(ERA5Dataset):
         self.forecast_steps = cfg.get("forecast_steps", 5)
 
     def __len__(self):
-        return sum(self.data["time.year"].values <= self.max_year) - 2 * self.time_step - (self.forecast_steps - 1) * self.time_step
+        years = self.data["time.year"].values
+        mask = years <= self.max_year
+        if self.min_year:
+            mask = mask & (years >= self.min_year)
+        return int(sum(mask)) - 2 * self.time_step - (self.forecast_steps - 1) * self.time_step
 
     def __getitem__(self, item):
-        ds_conditionals = self.data.isel(time=[item, item + self.time_step])
-        ds_state = self.data.isel(time=list(range(item + 2 * self.time_step, item + 2 * self.time_step + self.forecast_steps * self.time_step, self.time_step)))
+        idx = item + self._start_idx
+        ds_conditionals = self.data.isel(time=[idx, idx + self.time_step])
+        ds_state = self.data.isel(time=list(range(idx + 2 * self.time_step, idx + 2 * self.time_step + self.forecast_steps * self.time_step, self.time_step)))
 
         # Load inputs data
         ds_conditionals_atm = (

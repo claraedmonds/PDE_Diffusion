@@ -44,7 +44,11 @@ def train(cfg: DictConfig):
         print(f"Loading model from checkpoint {ckpt_path}")
         model = DiffusionModel.load_from_checkpoint(ckpt_path, cfg=cfg)
 
-    dataset_train, dataset_val = split_dataset(cfg, dataset)
+    if cfg.get("val_dataset", None):
+        dataset_train = dataset
+        dataset_val = DatasetRegistry.create(cfg.val_dataset)
+    else:
+        dataset_train, dataset_val = split_dataset(cfg, dataset)
 
     # To not get out-of-memory error, accumulate the gradients for batch sizes above 32
     batch_size = hp_config.batch_size
