@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 # end of SBATCH options
 
 mkdir -p logs/train_tiny
@@ -19,8 +19,8 @@ conda activate pde_diff
 
 python src/pde_diff/train.py \
     experiment=tiny \
-    dataset=era5 \
-    val_dataset=era5_val \
+    dataset=era5_tiny \
+    val_dataset=era5_val_tiny \
     loss.name=vorticity \
     wandb=False \
     model.save_best_model=True
