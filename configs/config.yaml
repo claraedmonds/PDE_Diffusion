@@ -1,6 +1,7 @@
 defaults:
   - experiment: exp1
   - dataset: era5
+  - val_dataset: null
   - scheduler: ddpm
   - hp_study: null
   - _self_
