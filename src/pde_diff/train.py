@@ -4,7 +4,6 @@ import torch
 
 import lightning as pl
 from torch.utils.data import DataLoader
-import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 
 from pde_diff.utils import DatasetRegistry, LossRegistry, unique_id
@@ -15,7 +14,6 @@ from pde_diff.data.utils import split_dataset
 
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../../configs")
 def train(cfg: DictConfig):
-    mp.set_start_method("spawn", force=True)
     hp_config = cfg.experiment.hyperparameters
     if cfg.get("k_folds") is not None:
         assert cfg.id is not None, "If k_folds is used, an id must be provided."

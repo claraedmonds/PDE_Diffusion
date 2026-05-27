@@ -7,31 +7,12 @@ import torch
 import einops
 from omegaconf import DictConfig
 from pde_diff.utils import DatasetRegistry, init_means_and_stds_era5
-import xarray as xr
 
 import pde_diff.data.const as const
 
-@DatasetRegistry.register("dataset1")
-class Dataset1(Dataset):
-    def __init__(self, cfg: DictConfig) -> None:
-        super().__init__()
-        self.transform = None
-        self.dataset = None
+_SECS_PER_HOUR = 3600
+_SECS_PER_DAY = 86400
 
-    def __len__(self) -> int:
-        """Return the length of the dataset."""
-        return len(self.dataset)
-
-    def __getitem__(self, idx) -> tuple:
-        """Return a given sample from the dataset."""
-        x, y = self.dataset[idx]
-        return x, y
-
-    def preprocess(self, output_folder: Path) -> None:
-        """Preprocess the raw data and save it to the output folder."""
-        output_folder.mkdir(parents=True, exist_ok=True)
-        # Implement your preprocessing logic here
-        pass
 
 @DatasetRegistry.register("fluid_data")
 class FluidData(Dataset):
@@ -63,7 +44,6 @@ class FluidData(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-
         if index >= self.num_datapoints:
             raise IndexError('index out of range')
         return self.data[index]
@@ -79,241 +59,149 @@ def generalized_b_xy_c_to_image(tensor, pixels_x=None, pixels_y=None):
     pattern = 'b (x y) ' + ' '.join([f'c{i}' for i in range(num_dims)]) + f' -> b ' + ' '.join([f'c{i}' for i in range(num_dims)]) + ' x y'
     return einops.rearrange(tensor, pattern, x=pixels_x, y=pixels_y)
 
-"""
-The ERA5Dataset class is responsible for loading and preprocessing the ERA5 dataset. This is a
-slightly modified version of the GenCastDataset class from
- https://github.com/openclimatefix/graph_weather/blob/main/graph_weather/data/gencast_dataloader.py
 
-It has to:
-- load, normalize and concatenate (across the channel dimension) the input timesteps 0 and 1.
-- load and normalize the residual between timesteps 2 and 1.
-
-(Noise sampling and corruption of targets has been removed from original code and will be handled elsewhere)
-"""
 @DatasetRegistry.register("era5")
 class ERA5Dataset(Dataset):
     """
-    Dataset class for ERA5 training data.
+    Dataset reading from pre-processed ERA5 zarr stores (see prepare_data.py).
+    Each store contains: fields (T, 15, nlon, nlat), time_unix (T,),
+    longitude (nlon,), latitude (nlat,), pressure_levels (3,).
+    Chunks are (1, 15, nlon, nlat) so each timestep read = one ~0.9 MB chunk.
     """
 
-    def __init__(
-        self,
-        cfg: DictConfig,
-    ):
-        """
-        Initialize the GenCast dataset object.
-
-        Args the cfg should have:
-            path: dataset path.
-            atmospheric_features: list of features depending on pressure levels.
-            single_features: list of features not depending on pressure levels.
-            static_features: list of features not depending on time.
-            max_year: max year to include in training set. Defaults to 2018.
-            time_step: time step between predictions.
-                        E.g. 12h steps correspond to time_step = 2 in a 6h dataset. Defaults to 2.
-        """
+    def __init__(self, cfg: DictConfig):
         super().__init__()
-        
-        import glob, xarray as xr
+        import zarr, glob
+
         paths = sorted(glob.glob(cfg.path))
         if not paths:
-            raise FileNotFoundError(f"No zarr stores found at {cfg.path}")
-        self.data = xr.concat([xr.open_zarr(p, chunks={}) for p in paths], dim="time")
+            raise FileNotFoundError(f"No processed zarr stores found at {cfg.path}")
 
-        # Downsample longitude and latitude
-        downsample_factor = cfg.get("downsample_factor", 2)  # Keep every 2nd grid point
-        if downsample_factor:
-            self.data = self.data.isel(
-                longitude=slice(0, None, downsample_factor),
-                latitude=slice(0, None, downsample_factor)
+        min_year = cfg.get("min_year", None)
+        max_year = cfg.get("max_year", None)
+
+        filtered = []
+        for p in paths:
+            try:
+                year = int(Path(p).name.rsplit("_", 1)[-1])
+            except ValueError:
+                continue
+            if min_year is not None and year < min_year:
+                continue
+            if max_year is not None and year > max_year:
+                continue
+            filtered.append(p)
+
+        if not filtered:
+            raise FileNotFoundError(
+                f"No processed zarr stores in year range [{min_year}, {max_year}] at {cfg.path}"
             )
-            print(f"Downsampled data by a factor of {downsample_factor}.")
-        self.max_year = cfg.max_year
-        self.min_year = cfg.get("min_year", None)
-        years = self.data["time.year"].values
-        self._start_idx = int(sum(years < self.min_year)) if self.min_year else 0
 
-        # Subset longitude and latitude
-        lon_range = cfg.get("lon_range", None)  # Example: [0, 50]
-        lat_range = cfg.get("lat_range", None)  # Example: [-50, 0]
+        self.time_step = cfg.time_step
 
-        if lon_range:
-            self.data = self.data.sel(longitude=slice(*lon_range))
-            print(f"Limiting longitude to range: {lon_range}")
-        if lat_range:
-            self.data = self.data.sel(latitude=slice(*lat_range))
-            print(f"Limiting latitude to range: {lat_range}")
+        # Open fields and time_unix as explicit zarr.Array for type-safe indexed reads
+        self.field_arrays = [zarr.open_array(str(Path(p) / 'fields'), mode='r') for p in filtered]
+        self.time_arrays  = [zarr.open_array(str(Path(p) / 'time_unix'), mode='r') for p in filtered]
 
-        if self.data["longitude"].shape[0] % 16 != 0:
-            # crop lat to multiple of 16
-            print(f"Cropping longitude of size {self.data['longitude'].shape[0]} to {(self.data['longitude'].shape[0] // 16) * 16}.")
-            self.data = self.data.isel(longitude=slice(0, -(self.data["longitude"].shape[0] % 16)))
+        # Build flat (store_idx, time_idx) index
+        self._index: list[tuple[int, int]] = []
+        for si, arr in enumerate(self.field_arrays):
+            T = arr.shape[0]
+            for t in range(T - 2 * self.time_step):
+                self._index.append((si, t))
 
-        if self.data["latitude"].shape[0] % 16 != 0:
-            # crop lat to multiple of 16
-            print(f"Cropping latitude of size {self.data['latitude'].shape[0]} to {(self.data['latitude'].shape[0] // 16) * 16}.")
-            self.data = self.data.isel(latitude=slice(0, -(self.data["latitude"].shape[0] % 16)))
-
-
-        self.grid_lon = self.data["longitude"].values
-        self.grid_lat = self.data["latitude"].values
+        # Convert coordinate arrays to numpy immediately
+        first = zarr.open_group(filtered[0], mode='r')
+        self.grid_lon      = np.asarray(first['longitude'], dtype=np.float32)
+        self.grid_lat      = np.asarray(first['latitude'],  dtype=np.float32)
+        self.pressure_levels = np.asarray(first['pressure_levels'], dtype=np.float32)
         self.num_lon = len(self.grid_lon)
         self.num_lat = len(self.grid_lat)
-        self.num_vars = len(self.data.keys())
-        self.pressure_levels = np.array(self.data["isobaricInhPa"].values).astype(
-            np.float32
-        )  # Need them for loss weighting
-        self.output_features_dim = len(cfg.atmospheric_features) * len(self.pressure_levels) + len(
-            cfg.single_features
-        )
-        self.input_features_dim = self.output_features_dim + len(cfg.static_features) + 4
-
-        self.time_step = cfg.time_step  # e.g. 2h steps correspond to time_step = 2 in a 1h dataset
 
         self.atmospheric_features = list(cfg.atmospheric_features)
         self.single_features = list(cfg.single_features)
         self.static_features = list(cfg.static_features)
+        n_atm = len(self.atmospheric_features) * len(self.pressure_levels)
+        n_single = len(self.single_features)
+        n_static = len(self.static_features)
+        self.output_features_dim = n_atm + n_single
+        self.input_features_dim = self.output_features_dim + n_static + 4  # +4 clock features
 
         self.normalization_on = cfg.get("normalize", True)
         if self.normalization_on:
-            self.means, self.stds, self.diff_means, self.diff_stds = init_means_and_stds_era5(self.atmospheric_features,
-                                                                                              self.single_features,
-                                                                                              self.static_features)
-
-    def _normalize(self, data, means, stds):
-        return (data - means[:, None, None]) / (stds[:, None, None])
-
-    def _unnormalize(self, data, means, stds):
-        return data * (stds[:, None, None]) + means[:, None, None]
-
-    def _sin_cos_emb(self, x):
-        return np.sin(2 * np.pi * x), np.cos(2 * np.pi * x)
-
-    def _generate_clock_features(self, ds):
-        # Compute sin/cos embedding for day of the year
-        day_of_year = ds.time.dt.dayofyear.values
-        day_of_year_grid = einops.repeat(
-            day_of_year, "t -> t lon lat", lon=self.num_lon, lat=self.num_lat
-        )
-        sin_day_of_year, cos_day_of_year = self._sin_cos_emb(day_of_year_grid / 365.0)
-
-
-        # Compute sin/cos embedding for local mean time
-        hour_of_day = ds.time.dt.hour.values
-        hour_of_day_grid = einops.repeat(
-            hour_of_day, "t -> t lon lat", lon=self.num_lon, lat=self.num_lat
-        )
-        local_mean_time = hour_of_day_grid + ds["longitude"].values[None, :, None] * 4 / 60.0
-        sin_local_mean_time, cos_local_mean_time = self._sin_cos_emb(local_mean_time / 24.0)
-
-        # Stack clock features
-        clock_input_data = np.stack(
-            [sin_day_of_year, cos_day_of_year, sin_local_mean_time, cos_local_mean_time], axis=-1
-        ).astype(np.float32)
-        clock_input_data = einops.rearrange(clock_input_data, "t lon lat clock -> t clock lon lat")
-
-        return clock_input_data
+            self.means, self.stds, self.diff_means, self.diff_stds = init_means_and_stds_era5(
+                self.atmospheric_features, self.single_features, self.static_features
+            )
 
     def __len__(self):
-        years = self.data["time.year"].values
-        mask = years <= self.max_year
-        if self.min_year:
-            mask = mask & (years >= self.min_year)
-        return int(sum(mask)) - 2 * self.time_step
+        return len(self._index)
+
+    def _clock_features(self, unix_t: int) -> np.ndarray:
+        """Return (4, nlon, nlat) clock features for a Unix timestamp (seconds)."""
+        year = int(np.datetime64(unix_t, 's').astype('datetime64[Y]').astype(np.int64)) + 1970
+        y_start = int(np.datetime64(f'{year}-01-01', 's').astype(np.int64))
+        y_end   = int(np.datetime64(f'{year + 1}-01-01', 's').astype(np.int64))
+        day_frac = (unix_t - y_start) / float(y_end - y_start)
+
+        hour = (unix_t % _SECS_PER_DAY) / float(_SECS_PER_HOUR)
+        local_time = ((hour + self.grid_lon * 4.0 / 60.0) % 24.0) / 24.0  # (nlon,)
+        local_time_2d = local_time[:, None] + np.zeros((1, self.num_lat), dtype=np.float32)  # (nlon, nlat)
+
+        sin_day = np.full((self.num_lon, self.num_lat), np.sin(2 * np.pi * day_frac), dtype=np.float32)
+        cos_day = np.full((self.num_lon, self.num_lat), np.cos(2 * np.pi * day_frac), dtype=np.float32)
+        sin_lmt = np.sin(2 * np.pi * local_time_2d).astype(np.float32)
+        cos_lmt = np.cos(2 * np.pi * local_time_2d).astype(np.float32)
+
+        return np.stack([sin_day, cos_day, sin_lmt, cos_lmt], axis=0)  # (4, nlon, nlat)
 
     def __getitem__(self, item):
-        idx = item + self._start_idx
-        ds_conditionals = self.data.isel(time=[idx, idx + self.time_step])
-        ds_state = self.data.isel(time=idx + 2 * self.time_step)
+        si, t = self._index[item]
+        fields = self.field_arrays[si]
+        times  = self.time_arrays[si]
+        ts = self.time_step
 
-        # Load inputs data
-        ds_conditionals_atm = (
-            ds_conditionals[self.atmospheric_features]
-            .to_array()
-            .transpose("time", "longitude", "latitude", "isobaricInhPa", "variable")
-            .values
-        )
-        ds_conditionals_atm = einops.rearrange(ds_conditionals_atm, "t lon lat lev var -> t  (var lev) lon lat")
-        raw_inputs = ds_conditionals_atm
+        f0 = fields[t].astype(np.float32)           # (15, nlon, nlat)
+        f1 = fields[t + ts].astype(np.float32)      # (15, nlon, nlat)
+        f2 = fields[t + 2 * ts].astype(np.float32)  # (15, nlon, nlat)
+        time0 = int(times[t])
+        time1 = int(times[t + ts])
 
-        if self.single_features:
-            ds_conditionals_single = (
-                ds_conditionals[self.single_features]
-                .to_array()
-                .transpose("time", "longitude", "latitude", "variable")
-                .values
-            )
-            ds_conditionals_single = einops.rearrange(ds_conditionals_single, "t lon lat var -> t var lon lat")
-            raw_inputs = np.concatenate([raw_inputs, ds_conditionals_single], axis=1)
-
-        if self.static_features:
-            ds_conditionals_static = (
-                ds_conditionals[self.static_features]
-                .to_array()
-                .transpose("longitude", "latitude", "variable")
-                .values
-            )
-            ds_conditionals_static = np.stack([ds_conditionals_static] * 2, axis=0)
-            ds_conditionals_static = einops.rearrange(ds_conditionals_static, "t lon lat var -> t (var) lon lat")
-            raw_inputs = np.concatenate([raw_inputs, ds_conditionals_static], axis=1)
-
-
-        # Normalize inputs
         if self.normalization_on:
-            inputs_norm = self._normalize(raw_inputs, self.means, self.stds)
+            m, s = self.means[:, None, None], self.stds[:, None, None]
+            f0n = (f0 - m) / s
+            f1n = (f1 - m) / s
         else:
-            inputs_norm = raw_inputs
+            f0n, f1n = f0.copy(), f1.copy()
 
-        # Add time features
-        clock_features = self._generate_clock_features(ds_conditionals)
-        inputs = np.concatenate([inputs_norm, clock_features], axis=1)
+        clk0 = self._clock_features(time0)  # (4, nlon, nlat)
+        clk1 = self._clock_features(time1)  # (4, nlon, nlat)
 
-        # Concatenate timesteps
-        inputs = np.concatenate([inputs[0, :, :, :], inputs[1, :, :, :]], axis=0)
-        prev_inputs = np.nan_to_num(inputs).astype(np.float32)
+        inp0 = np.concatenate([f0n, clk0], axis=0)   # (19, nlon, nlat)
+        inp1 = np.concatenate([f1n, clk1], axis=0)   # (19, nlon, nlat)
+        prev_inputs = np.concatenate([inp0, inp1], axis=0).astype(np.float32)  # (38, nlon, nlat)
 
-        # Load target data
-        ds_state_atm = (
-            ds_state[self.atmospheric_features]
-            .to_array()
-            .transpose("longitude", "latitude", "isobaricInhPa", "variable")
-            .values
-        )
-        ds_state_atm = einops.rearrange(ds_state_atm, "lon lat lev var -> (var lev) lon lat")
-        raw_state = ds_state_atm
-        if self.single_features:
-            ds_state_single = (
-                ds_state[self.single_features]
-                .to_array()
-                .transpose("longitude", "latitude", "variable")
-                .values
-            )
-            ds_state_single = einops.rearrange(ds_state_single, "lon lat var -> (var) lon lat")
-            raw_state = np.concatenate([raw_state, ds_state_single], axis=0)
-
-        # Normalize target residuals
-        raw_state_change = raw_state - raw_inputs[1]
+        raw_residual = f2 - f1
         if self.normalization_on:
-            state_change = self._normalize(raw_state_change, self.diff_means, self.diff_stds)
+            dm, ds = self.diff_means[:, None, None], self.diff_stds[:, None, None]
+            state_change = (raw_residual - dm) / ds
         else:
-            state_change = raw_state_change
+            state_change = raw_residual
         state_change = np.nan_to_num(state_change).astype(np.float32)
 
         return (prev_inputs, state_change)
+
 
 def increment_clock_features(clock_features: torch.Tensor, step_size: int) -> torch.Tensor:
     """
     Increment clock features by a given hourly step size using PyTorch.
     """
-    # Extract the day and time and compute their angles
     sin_day_of_year, cos_day_of_year = clock_features[:, 0,:,:], clock_features[:, 1,:,:]
     sin_local_mean_time, cos_local_mean_time = clock_features[:, 2,:,:], clock_features[:, 3,:,:]
     day_of_year_angle = torch.atan2(sin_day_of_year, cos_day_of_year)
     local_mean_time_angle = torch.atan2(sin_local_mean_time, cos_local_mean_time)
 
-    # Increment the angles
-    day_of_year_angle += 2 * torch.pi * step_size / (365 * 24)  # Increment day of year angle
-    local_mean_time_angle += 2 * torch.pi * step_size / 24      # Increment local mean time angle
+    day_of_year_angle += 2 * torch.pi * step_size / (365 * 24)
+    local_mean_time_angle += 2 * torch.pi * step_size / 24
     day_of_year_angle = day_of_year_angle % (2 * torch.pi)
     local_mean_time_angle = local_mean_time_angle % (2 * torch.pi)
 
@@ -322,124 +210,69 @@ def increment_clock_features(clock_features: torch.Tensor, step_size: int) -> to
     sin_local_mean_time = torch.sin(local_mean_time_angle)
     cos_local_mean_time = torch.cos(local_mean_time_angle)
 
-    updated_clock_features = torch.stack(
+    return torch.stack(
         [sin_day_of_year, cos_day_of_year, sin_local_mean_time, cos_local_mean_time], dim=1
     )
-    return updated_clock_features
+
 
 @DatasetRegistry.register("era5_test")
 class ERA5DatasetTest(ERA5Dataset):
     """
-    Dataset class for ERA5 test data.
-    The get item returns multiple forecast steps in the future for comparison.
+    Test dataset returning multi-step forecast targets.
+    Returns (prev_inputs, state_change, raw_state) where the last two have a
+    leading forecast_steps dimension.
     """
 
-    def __init__(
-        self,
-        cfg: DictConfig,
-    ):
-
+    def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self.forecast_steps = cfg.get("forecast_steps", 5)
-
-    def __len__(self):
-        years = self.data["time.year"].values
-        mask = years <= self.max_year
-        if self.min_year:
-            mask = mask & (years >= self.min_year)
-        return int(sum(mask)) - 2 * self.time_step - (self.forecast_steps - 1) * self.time_step
+        # Rebuild index with extended lookahead
+        self._index = []
+        for si, arr in enumerate(self.field_arrays):
+            T = arr.shape[0]
+            max_t = T - 2 * self.time_step - (self.forecast_steps - 1) * self.time_step
+            for t in range(max_t):
+                self._index.append((si, t))
 
     def __getitem__(self, item):
-        idx = item + self._start_idx
-        ds_conditionals = self.data.isel(time=[idx, idx + self.time_step])
-        ds_state = self.data.isel(time=list(range(idx + 2 * self.time_step, idx + 2 * self.time_step + self.forecast_steps * self.time_step, self.time_step)))
+        si, t = self._index[item]
+        fields = self.field_arrays[si]
+        times  = self.time_arrays[si]
+        ts = self.time_step
 
-        # Load inputs data
-        ds_conditionals_atm = (
-            ds_conditionals[self.atmospheric_features]
-            .to_array()
-            .transpose("time", "longitude", "latitude", "isobaricInhPa", "variable")
-            .values
-        )
-        ds_conditionals_atm = einops.rearrange(ds_conditionals_atm, "t lon lat lev var -> t  (var lev) lon lat")
-        raw_inputs = ds_conditionals_atm
+        f0 = fields[t].astype(np.float32)
+        f1 = fields[t + ts].astype(np.float32)
+        time0 = int(times[t])
+        time1 = int(times[t + ts])
 
-        if self.single_features:
-            ds_conditionals_single = (
-                ds_conditionals[self.single_features]
-                .to_array()
-                .transpose("time", "longitude", "latitude", "variable")
-                .values
-            )
-            ds_conditionals_single = einops.rearrange(ds_conditionals_single, "t lon lat var -> t var lon lat")
-            raw_inputs = np.concatenate([raw_inputs, ds_conditionals_single], axis=1)
-
-        if self.static_features:
-            ds_conditionals_static = (
-                ds_conditionals[self.static_features]
-                .to_array()
-                .transpose("longitude", "latitude", "variable")
-                .values
-            )
-            ds_conditionals_static = np.stack([ds_conditionals_static] * 2, axis=0)
-            ds_conditionals_static = einops.rearrange(ds_conditionals_static, "t lon lat var -> t (var) lon lat")
-            raw_inputs = np.concatenate([raw_inputs, ds_conditionals_static], axis=1)
-
-
-        # Normalize inputs
         if self.normalization_on:
-            inputs_norm = self._normalize(raw_inputs, self.means, self.stds)
+            m, s = self.means[:, None, None], self.stds[:, None, None]
+            f0n = (f0 - m) / s
+            f1n = (f1 - m) / s
         else:
-            inputs_norm = raw_inputs
+            f0n, f1n = f0.copy(), f1.copy()
 
-        # Add time features
-        clock_features = self._generate_clock_features(ds_conditionals)
-        inputs = np.concatenate([inputs_norm, clock_features], axis=1)
+        clk0 = self._clock_features(time0)
+        clk1 = self._clock_features(time1)
 
-        # Concatenate timesteps
-        inputs = np.concatenate([inputs[0, :, :, :], inputs[1, :, :, :]], axis=0)
-        prev_inputs = np.nan_to_num(inputs).astype(np.float32)
+        inp0 = np.concatenate([f0n, clk0], axis=0)
+        inp1 = np.concatenate([f1n, clk1], axis=0)
+        prev_inputs = np.concatenate([inp0, inp1], axis=0).astype(np.float32)
 
-        # Load target data
-        ds_state_atm = (
-            ds_state[self.atmospheric_features]
-            .to_array()
-            .transpose("time","longitude", "latitude", "isobaricInhPa", "variable")
-            .values
-        )
-        ds_state_atm = einops.rearrange(ds_state_atm, "t lon lat lev var -> t (var lev) lon lat")
-        raw_state = ds_state_atm
-        if self.single_features:
-            ds_state_single = (
-                ds_state[self.single_features]
-                .to_array()
-                .transpose("time","longitude", "latitude", "variable")
-                .values
-            )
-            ds_state_single = einops.rearrange(ds_state_single, "t lon lat var -> t (var) lon lat")
-            raw_state = np.concatenate([raw_state, ds_state_single], axis=1)
+        target_fields = np.stack(
+            [fields[t + 2 * ts + step * ts].astype(np.float32)
+             for step in range(self.forecast_steps)],
+            axis=0,
+        )  # (steps, 15, nlon, nlat)
 
-        # Normalize target state changes
-        raw_state_change = raw_state - np.copy(np.concatenate([raw_inputs[None,1, :, :, :], raw_state[:-1,:,:,:]], axis=0))
+        prev_states = np.concatenate([f1[None], target_fields[:-1]], axis=0)
+        raw_residuals = target_fields - prev_states
+
         if self.normalization_on:
-            state_change = self._normalize(raw_state_change, self.diff_means, self.diff_stds)
+            dm, ds = self.diff_means[:, None, None], self.diff_stds[:, None, None]
+            state_change = (raw_residuals - dm) / ds
         else:
-            state_change = raw_state_change
+            state_change = raw_residuals
         state_change = np.nan_to_num(state_change).astype(np.float32)
 
-        return (prev_inputs, state_change, raw_state )
-
-if __name__ == "__main__":
-    # Test ERA5 data:
-    from omegaconf import OmegaConf
-    cfg = OmegaConf.load("configs/dataset/era5.yaml")
-
-    ERA5_dataset = ERA5Dataset(cfg=cfg)
-    ERA5_dataset_len = len(ERA5_dataset)
-    print(f"Longitude grid size: {len(ERA5_dataset.grid_lon)}")
-    print(f"Latitude grid size: {len(ERA5_dataset.grid_lat)}")
-    print(f"ERA5 Dataset length: {ERA5_dataset_len}")
-
-    sample_idx = 10
-    prev_inputs, target_residuals = ERA5_dataset[sample_idx]
-    print(f"Sample prev_inputs shape: {prev_inputs.shape}, Sample target_residuals shape: {target_residuals.shape}")
+        return (prev_inputs, state_change, target_fields)
