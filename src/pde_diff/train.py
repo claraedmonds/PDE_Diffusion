@@ -55,9 +55,9 @@ def train(cfg: DictConfig):
         accumulate_no_batches=hp_config.batch_size//32
         batch_size = 32
 
-    train_dataloader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=4,persistent_workers=True, worker_init_fn=worker_init_fn)
+    train_dataloader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=4)
     if dataset_val:
-        val_dataloader = DataLoader(dataset_val, batch_size=batch_size, shuffle=False, num_workers=4,persistent_workers=True, worker_init_fn=worker_init_fn)
+        val_dataloader = DataLoader(dataset_val, batch_size=batch_size, shuffle=False, num_workers=4)
     
     wandb_name = f"{cfg.experiment.name}-{cfg.id}"
 
@@ -85,12 +85,6 @@ def train(cfg: DictConfig):
     else:
         trainer.fit(model, train_dataloader)
     print(f"Training completed of model {cfg.id}")
-
-def worker_init_fn(worker_id):
-    info = torch.utils.data.get_worker_info()
-    ds = info.dataset
-    if hasattr(ds, "_open"):
-        ds.ds = None
 
 if __name__ == "__main__":
     train()
