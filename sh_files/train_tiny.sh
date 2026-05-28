@@ -22,5 +22,6 @@ python src/pde_diff/train.py \
     dataset=era5_tiny \
     val_dataset=era5_val_tiny \
     loss.name=vorticity \
+    loss.c_residual=0 \
     wandb=False \
     model.save_best_model=True
