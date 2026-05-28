@@ -83,6 +83,7 @@ def train(cfg: DictConfig):
     else:
         trainer.fit(model, train_dataloader)
     print(f"Training completed of model {cfg.id}")
+    os._exit(0) # To avoid hanging 
 
 def worker_init_fn(worker_id):
     info = torch.utils.data.get_worker_info()
