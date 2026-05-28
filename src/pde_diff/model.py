@@ -189,7 +189,7 @@ class DiffusionModel(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hp_config.lr, weight_decay=self.hp_config.weight_decay)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.99)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50) # Reset every 50 epochs (TODO make this configurable)
         return [optimizer], [scheduler]
 
     def forward(self, samples, t):
