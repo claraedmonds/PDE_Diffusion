@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=01:00:00
+#SBATCH --time=04:00:00
 # end of SBATCH options
 
 mkdir -p logs/train_tiny
@@ -23,4 +23,4 @@ python src/pde_diff/train.py \
     loss.name=vorticity \
     loss.c_residual=0 \
     model.save_best_model=True \
-    wandb=False 
+    wandb=False
