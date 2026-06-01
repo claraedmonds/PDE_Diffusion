@@ -19,7 +19,7 @@ atmospheric_features:
 
 single_features: []
 static_features: []
-max_year: 2025
+max_year: 2016
 time_step: 1
 
 "lon_range": null # Data is full range
