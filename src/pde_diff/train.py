@@ -28,6 +28,14 @@ def train(cfg: DictConfig):
     dataset = DatasetRegistry.create(cfg.dataset)
     model = DiffusionModel(cfg)
 
+    # For precomputed datasets the loss mean/std aren't set inside DiffusionModel
+    # (which only initialises them for cfg.dataset.name == 'era5').
+    if cfg.loss.name == 'vorticity' and hasattr(dataset, 'means'):
+        if not hasattr(model.loss_fn, 'std'):
+            model.loss_fn.set_mean_and_std(
+                dataset.means, dataset.stds, dataset.diff_means, dataset.diff_stds
+            )
+
     if ckpt_path:=cfg.model.get("ckpt_path", None):
         # load weight parameters
         if cfg.get("k_folds", None):
@@ -74,7 +82,9 @@ def train(cfg: DictConfig):
         logger=logger,
         log_every_n_steps=hp_config.log_every_n_steps,
         callbacks=[SaveBestModel()],
-        accumulate_grad_batches=accumulate_no_batches
+        accumulate_grad_batches=accumulate_no_batches,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
     )
 
     print(f"Starting training of model {cfg.id}")

@@ -167,3 +167,16 @@ To use pre-commit checks run the following line:
 Created using [mlops_template](https://github.com/SkafteNicki/mlops_template),
 a [cookiecutter template](https://github.com/cookiecutter/cookiecutter) for getting
 started with Machine Learning Operations (MLOps).
+
+## Split
+# train
+min_year: 2015
+max_year: 2020
+
+# validation  
+min_year: 2021
+max_year: 2022
+
+# test
+min_year: 2023
+max_year: 2024

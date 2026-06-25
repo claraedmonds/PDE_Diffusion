@@ -20,6 +20,8 @@ conda activate pde_diff
 python src/pde_diff/train.py \
     experiment=tiny \
     dataset=era5_tiny \
+    model.name=unet3d_conditional \
+    id=first_unet3d_conditional \
     loss.name=vorticity \
     loss.c_residual=0 \
     model.save_best_model=True \
