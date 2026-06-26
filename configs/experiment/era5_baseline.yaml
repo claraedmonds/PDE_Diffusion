@@ -3,7 +3,8 @@ name: era5_baseline
 hyperparameters:
   batch_size: 16
   max_epochs: 50
-  log_every_n_steps: 10
-  lr: 0.0006025681216867252
-  weight_decay: 8.21377909811062e-06
+  log_every_n_steps: 5
+  lr: 0.001
+  weight_decay: 0.005
   dropout: 0.0
+1

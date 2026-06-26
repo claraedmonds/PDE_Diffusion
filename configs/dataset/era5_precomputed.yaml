@@ -1,0 +1,22 @@
+name: era5_precomputed
+path: ./data/era5/precomputed
+time_series: True
+use_double: False
+validation_metrics: ['mse', 'era5_vorticity']
+test_metrics: [mse]
+dims:
+  x: 480
+  y: 32
+  input_dims: 53
+  output_dims: 15
+train: true
+atmospheric_features:
+  - 'u'
+  - 'v'
+  - 'pv'
+  - 't'
+  - 'z'
+single_features: []
+static_features: []
+min_year: 2015
+max_year: 2022

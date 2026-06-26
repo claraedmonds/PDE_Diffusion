@@ -169,14 +169,14 @@ a [cookiecutter template](https://github.com/cookiecutter/cookiecutter) for gett
 started with Machine Learning Operations (MLOps).
 
 ## Split
-# train
+### train & validation (k-folds)
 min_year: 2015
-max_year: 2020
-
-# validation  
-min_year: 2021
 max_year: 2022
 
-# test
+### test
 min_year: 2023
 max_year: 2024
+
+### experiments
+tiny_firstUNet3D_conditional : first run with correct model for ERA5! 
+baseline: 5-fold validation of model with hyperparameters as detailed in J&M thesis
