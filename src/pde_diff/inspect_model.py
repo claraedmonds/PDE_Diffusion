@@ -4,6 +4,7 @@ Quick inspection script: loss curves + a few predicted vs target sample plots.
 Usage:
     python src/pde_diff/inspect_model.py --model-id tiny-geqcd
     python src/pde_diff/inspect_model.py --model-id tiny-geqcd --n-samples 3 --out-dir reports/inspect
+    python src/pde_diff/inspect_model.py --model-id era5_baseline-diagnostic-1 --fold-num 3
 
 Reads:
     models/<model-id>/config.yaml          — training config
@@ -13,6 +14,7 @@ Reads:
 Writes PNGs to <out-dir>/<model-id>/.
 """
 import argparse
+import re
 from pathlib import Path
 
 import einops
@@ -32,6 +34,7 @@ try:
     from pde_diff.visualize import (
         visualize_era5_sample,
         plot_training_metrics,
+        plot_cv_individual_fold_curves,
         VAR_NAMES,
         VAR_UNITS,
         COLOR_BARS,
@@ -53,10 +56,15 @@ LEVELS = [450, 500, 550]
 # Loss curves
 # ---------------------------------------------------------------------------
 
-def plot_loss_curves(model_id: str, out_dir: Path) -> None:
+def plot_loss_curves(model_id: str, out_dir: Path, fold_num: int | None = None) -> None:
     if _VISUALIZE_OK:
         # reuse the existing function which handles all metrics
         plot_training_metrics(model_id, out_dir=out_dir.parent)
+        if fold_num:
+            # model_id may be a specific fold (e.g. "era5_baseline-diagnostic-1");
+            # strip the trailing "-<fold>" to get the base id shared by all folds.
+            base_id = re.sub(r"-\d+$", "", model_id)
+            plot_cv_individual_fold_curves(base_id, fold_num, log_path="logs", out_dir=out_dir.parent)
         return
 
     # Fallback: plain matplotlib
@@ -147,14 +155,15 @@ def plot_sample(pred: torch.Tensor, target: torch.Tensor,
 # ---------------------------------------------------------------------------
 
 def main(model_id: str, n_samples: int, out_dir: Path,
-         dataset_path: Path | None, min_year: str | None, max_year: str | None) -> None:
+         dataset_path: Path | None, min_year: str | None, max_year: str | None,
+         fold_num: int | None = None) -> None:
     model_dir = Path("models") / model_id
     out_dir   = out_dir / model_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Loss curves --------------------------------------------------------
     print("Plotting loss curves ...")
-    plot_loss_curves(model_id, out_dir)
+    plot_loss_curves(model_id, out_dir, fold_num=fold_num)
 
     # --- Load model ---------------------------------------------------------
     print("Loading model ...")
@@ -224,6 +233,10 @@ if __name__ == "__main__":
                         help="Override min_year from config")
     parser.add_argument("--max-year",      type=str,  default=None,
                         help="Override max_year from config")
+    parser.add_argument("--fold-num",      type=int,  default=None,
+                        help="If set, also plot each fold's loss curve separately "
+                             "(model-id's base, i.e. without the trailing '-<fold>', "
+                             "is expected to have folds 1..fold-num under models/ and logs/)")
     args = parser.parse_args()
     main(args.model_id, args.n_samples, args.out_dir,
-         args.dataset_path, args.min_year, args.max_year)
+         args.dataset_path, args.min_year, args.max_year, args.fold_num)

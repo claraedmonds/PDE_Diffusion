@@ -23,7 +23,7 @@ class DiffusionModel(pl.LightningModule):
         self.loss_fn = LossRegistry.create(cfg.loss)
         self.hp_config = cfg.experiment.hyperparameters
         self.model = ModelRegistry.create([cfg.model, self.hp_config])
-        if cfg.dataset.name == 'era5' and cfg.loss.name == 'vorticity': #semi cursed (TODO clean up)
+        if cfg.dataset.name in ('era5', 'era5_precomputed') and cfg.loss.name == 'vorticity': #semi cursed (TODO clean up)
             self.atmospheric_features = cfg.dataset.atmospheric_features
             self.single_features = cfg.dataset.single_features
             self.static_features = cfg.dataset.static_features
@@ -189,7 +189,7 @@ class DiffusionModel(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hp_config.lr, weight_decay=self.hp_config.weight_decay)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.99)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hp_config.max_epochs, eta_min=1e-6)
         return [optimizer], [scheduler]
 
     def forward(self, samples, t):

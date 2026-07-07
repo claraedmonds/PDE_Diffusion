@@ -15,8 +15,9 @@
 # Usage: sbatch sh_files/inspect_model.sh <model-id> [n-samples]
 #   e.g. sbatch sh_files/inspect_model.sh tiny-first_unet3d_conditional
 
-MODEL_ID=${1:?"Usage: sbatch inspect_model.sh <model-id> [n-samples]"}
-N_SAMPLES=${2:-3}
+MODEL_ID=${1:?"Usage: sbatch inspect_model.sh <model-id> [n-folds] [n-samples]"}
+N_FOLDS=${2:-5}
+N_SAMPLES=${3:-3}
 
 mkdir -p logs/inspect_model
 
@@ -25,5 +26,6 @@ conda activate pde_diff
 
 python src/pde_diff/inspect_model.py \
     --model-id "${MODEL_ID}" \
+    --fold-num "${N_FOLDS}" \
     --n-samples "${N_SAMPLES}" \
     --out-dir reports/inspect

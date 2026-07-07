@@ -32,31 +32,54 @@ from tqdm import tqdm
 from pde_diff.data.datasets import ERA5Dataset
 
 
-def samples_for_year(cfg_base, zarr_dir: Path, year: str) -> tuple[np.ndarray, np.ndarray]:
-    """Load one year's zarr into RAM and return all (input, target) arrays."""
+def samples_for_year(cfg_base, zarr_dir: Path, year: str,
+                     time_step: int = 1, expected_step_hours: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Load one year's zarr into RAM, skip cross-gap triplets, return valid (input, target) arrays."""
     cfg = deepcopy(cfg_base)
     cfg.path = str(zarr_dir / f"zarr_{year}")
     cfg.max_year = int(year)
 
     dataset = ERA5Dataset(cfg)
-    N = len(dataset)
-    print(f"  {year}: {N} samples — loading into RAM ...", flush=True)
+
+    # Detect within-year gaps (Feb→Dec boundary in winter-only data).
+    # A triplet starting at item index i accesses time indices i, i+S, i+2*S.
+    # It straddles gap g when i in [g-2*S+1, g] — drop those starts.
+    times = dataset.data.time.values
+    diffs = np.diff(times).astype("timedelta64[h]").astype(int)
+    gap_positions = np.where(diffs > expected_step_hours)[0]
+
+    invalid_starts: set[int] = set()
+    for g in gap_positions:
+        for k in range(2 * time_step):
+            idx = g - k
+            if idx >= 0:
+                invalid_starts.add(idx)
+
+    N_raw = len(dataset)
+    valid_items = [i for i in range(N_raw) if i not in invalid_starts]
+    N = len(valid_items)
+
+    if gap_positions.size:
+        print(f"  {year}: {N} samples ({N_raw - N} cross-gap triplets removed) — loading into RAM ...", flush=True)
+    else:
+        print(f"  {year}: {N} samples — loading into RAM ...", flush=True)
+
     dataset.data = dataset.data.load()
     print(f"  {year}: in-memory, iterating ...", flush=True)
 
-    sample_input, sample_target = dataset[0]
-    inputs = np.empty((N, *sample_input.shape), dtype=np.float32)
+    sample_input, sample_target = dataset[valid_items[0]]
+    inputs  = np.empty((N, *sample_input.shape),  dtype=np.float32)
     targets = np.empty((N, *sample_target.shape), dtype=np.float32)
-    inputs[0] = sample_input
+    inputs[0]  = sample_input
     targets[0] = sample_target
-    for i in tqdm(range(1, N), desc=f"  {year}", leave=False):
-        inputs[i], targets[i] = dataset[i]
+    for j, item_idx in enumerate(tqdm(valid_items[1:], desc=f"  {year}", leave=False), start=1):
+        inputs[j], targets[j] = dataset[item_idx]
 
     return inputs, targets
 
 
 def precompute(dataset_config_path: Path, zarr_dir: Path,
-               years: list[str], out_dir: Path) -> None:
+               years: list[str], out_dir: Path, force: bool = False) -> None:
     cfg_base = OmegaConf.load(dataset_config_path)
     assert isinstance(cfg_base, DictConfig), "Dataset config must be a yaml mapping, not a list"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +88,12 @@ def precompute(dataset_config_path: Path, zarr_dir: Path,
     metadata_path = out_dir / "metadata.json"
     inputs_path   = out_dir / "inputs.npy"
     targets_path  = out_dir / "targets.npy"
+
+    if force:
+        for p in (progress_path, metadata_path, inputs_path, targets_path):
+            if p.exists():
+                p.unlink()
+                print(f"--force: removed {p}")
 
     completed = json.loads(progress_path.read_text()) if progress_path.exists() else []
     years_todo = [y for y in years if y not in completed]
@@ -159,5 +188,7 @@ if __name__ == "__main__":
                         default=[str(y) for y in range(2015, 2025)])
     parser.add_argument("--out-dir", type=Path,
                         default=Path("./data/era5/precomputed"))
+    parser.add_argument("--force", action="store_true",
+                        help="Delete existing precomputed data and reprocess all years from scratch")
     args = parser.parse_args()
-    precompute(args.dataset_config, args.zarr_dir, args.years, args.out_dir)
+    precompute(args.dataset_config, args.zarr_dir, args.years, args.out_dir, force=args.force)

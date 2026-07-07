@@ -205,6 +205,81 @@ def plot_training_metrics(model_id, out_dir=Path("./reports/figures")):
             plt.close(ax.figure)
 
 
+def plot_cv_individual_fold_curves(
+    model_id,
+    fold_num,
+    log_path="logs",
+    out_dir=Path("./reports/figures"),
+    metrics=("train_loss", "val_loss"),
+    smooth_window=1,
+):
+    """
+    Plot each fold's loss curve separately (one line per fold, no averaging
+    across folds), for a cross-validated model `{model_id}-1` .. `{model_id}-{fold_num}`.
+    """
+    out_dir = Path(out_dir)
+    save_dir = out_dir / model_id
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    def smooth(arr, window):
+        if window <= 1:
+            return arr
+        kernel = np.ones(window) / window
+        return np.convolve(arr, kernel, mode="valid")
+
+    cmap = plt.get_cmap("tab10")
+
+    for metric in metrics:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        any_plotted = False
+
+        for fold in range(1, fold_num + 1):
+            csv_path = Path(log_path) / f"{model_id}-{fold}" / "version_0" / "metrics.csv"
+            if not csv_path.exists():
+                print(f"  Skipping fold {fold}: {csv_path} not found.")
+                continue
+
+            df = (
+                pd.read_csv(csv_path)
+                .apply(pd.to_numeric, errors="coerce")
+                .dropna(subset=["step"])
+                .sort_values("step")
+            )
+            if metric not in df.columns:
+                continue
+
+            sub = df[["epoch", metric]].dropna()
+            if sub.empty:
+                continue
+
+            epochs = sub["epoch"].values
+            vals = sub[metric].values
+            if smooth_window > 1:
+                vals = smooth(vals, smooth_window)
+                epochs = epochs[: len(vals)]
+
+            ax.plot(epochs, vals, label=f"Fold {fold}", color=cmap(fold % 10))
+            any_plotted = True
+
+        if not any_plotted:
+            plt.close(fig)
+            print(f"  No data found for metric '{metric}', skipping plot.")
+            continue
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(metric)
+        ax.set_title(f"{metric} per fold — {model_id}")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=True, fancybox=True, framealpha=0.9)
+        fig.tight_layout()
+
+        save_path = save_dir / f"{metric}_per_fold{PLOT_TYPE}"
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {save_path}")
+
+
 def get_data_sample(dataset, sample_idx, variable, level=500):
     """
     Extract data for visualization from the ERA5 dataset.

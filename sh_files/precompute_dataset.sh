@@ -22,4 +22,5 @@ conda activate pde_diff
 
 python src/pde_diff/data/precompute_dataset.py \
     --dataset-config configs/dataset/era5.yaml \
-    --out-dir ./data/era5/precomputed
+    --out-dir ./data/era5/precomputed \
+    --force
