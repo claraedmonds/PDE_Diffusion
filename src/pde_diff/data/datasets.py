@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import torch
 from torch.utils.data import Dataset
 import pandas as pd
@@ -410,6 +411,82 @@ class ERA5DatasetTest(ERA5Dataset):
         state_change = np.nan_to_num(state_change).astype(np.float32)
 
         return (prev_inputs, state_change, raw_state )
+
+@DatasetRegistry.register("era5_precomputed")
+class PrecomputedERA5Dataset(Dataset):
+    """
+    Wraps pre-materialised numpy memory-mapped arrays produced by
+    precompute_dataset.py.  __getitem__ is pure array indexing — no zarr /
+    xarray overhead — making data loading ~100x faster than ERA5Dataset.
+
+    The directory must contain:
+        inputs.npy, targets.npy, metadata.json
+    as written by precompute_dataset.py.
+    """
+
+    def __init__(self, cfg: DictConfig) -> None:
+        super().__init__()
+        out_dir = Path(cfg.path)
+        with open(out_dir / "metadata.json") as f:
+            meta = json.load(f)
+
+        N = meta["N"]
+        input_shape = tuple(meta["input_shape"])
+        target_shape = tuple(meta["target_shape"])
+
+        self.inputs = np.memmap(out_dir / "inputs.npy", dtype=np.float32,
+                                mode="r", shape=(N, *input_shape))
+        self.targets = np.memmap(out_dir / "targets.npy", dtype=np.float32,
+                                 mode="r", shape=(N, *target_shape))
+
+        # Compute start/end indices from year boundaries if min/max_year specified
+        n_per_year = meta.get("n_per_year", {})
+        years_sorted = sorted(n_per_year.keys())  # strings, but sort lexically (same as numeric for 4-digit years)
+        cumulative = {}
+        total = 0
+        for y in years_sorted:
+            cumulative[y] = total
+            total += n_per_year[y]
+
+        min_year = str(cfg.get("min_year", years_sorted[0] if years_sorted else None))
+        max_year = str(cfg.get("max_year", years_sorted[-1] if years_sorted else None))
+
+        if n_per_year and min_year and max_year:
+            years_in_range = [y for y in years_sorted if min_year <= y <= max_year]
+            if not years_in_range:
+                raise ValueError(f"No years found between min_year={min_year} and max_year={max_year}. Available: {years_sorted}")
+            self.start_idx = cumulative[years_in_range[0]]
+            self.end_idx   = cumulative[years_in_range[-1]] + n_per_year[years_in_range[-1]]
+            print(f"Using years {years_in_range[0]}–{years_in_range[-1]}: samples {self.start_idx}–{self.end_idx} ({self.end_idx - self.start_idx} total)")
+        else:
+            self.start_idx = 0
+            self.end_idx   = N
+
+        # Attributes expected by evaluate.py / visualize.py / VorticityLoss
+        self.pressure_levels = np.array(meta["pressure_levels"], dtype=np.float32)
+        self.grid_lon = np.array(meta["grid_lon"], dtype=np.float32)
+        self.grid_lat = np.array(meta["grid_lat"], dtype=np.float32)
+        self.means = np.array(meta["means"], dtype=np.float32)
+        self.stds = np.array(meta["stds"], dtype=np.float32)
+        self.diff_means = np.array(meta["diff_means"], dtype=np.float32)
+        self.diff_stds = np.array(meta["diff_stds"], dtype=np.float32)
+
+    def _normalize(self, data, means, stds):
+        return (data - means[:, None, None]) / stds[:, None, None]
+
+    def _unnormalize(self, data, means, stds):
+        return data * stds[:, None, None] + means[:, None, None]
+
+    def __len__(self) -> int:
+        return self.end_idx - self.start_idx
+
+    def __getitem__(self, idx):
+        actual_idx = self.start_idx + idx
+        return (
+            torch.from_numpy(self.inputs[actual_idx].copy()),
+            torch.from_numpy(self.targets[actual_idx].copy()),
+        )
+
 
 if __name__ == "__main__":
     # Test ERA5 data:

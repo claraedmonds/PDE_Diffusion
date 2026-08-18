@@ -1,9 +1,9 @@
 name: tiny
 
 hyperparameters:
-  batch_size: 4
-  max_epochs: 5
+  batch_size: 32 # revert to 16
+  max_epochs: 30
   log_every_n_steps: 2
-  lr: 0.001
-  weight_decay: 0.01
-  dropout: 0.25
+  lr: 0.0001 # 0.001
+  weight_decay: 0.01 # research suggest 0.005
+  dropout: 0.1 # must try later with 0 dropout

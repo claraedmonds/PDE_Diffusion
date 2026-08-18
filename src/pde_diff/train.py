@@ -28,6 +28,14 @@ def train(cfg: DictConfig):
     dataset = DatasetRegistry.create(cfg.dataset)
     model = DiffusionModel(cfg)
 
+    # For precomputed datasets the loss mean/std aren't set inside DiffusionModel
+    # (which only initialises them for cfg.dataset.name == 'era5').
+    if cfg.loss.name == 'vorticity' and hasattr(dataset, 'means'):
+        if not hasattr(model.loss_fn, 'std'):
+            model.loss_fn.set_mean_and_std(
+                dataset.means, dataset.stds, dataset.diff_means, dataset.diff_stds
+            )
+
     if ckpt_path:=cfg.model.get("ckpt_path", None):
         # load weight parameters
         if cfg.get("k_folds", None):
@@ -53,9 +61,9 @@ def train(cfg: DictConfig):
         accumulate_no_batches=hp_config.batch_size//32
         batch_size = 32
 
-    train_dataloader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=4,persistent_workers=True, worker_init_fn=worker_init_fn)
+    train_dataloader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=0, worker_init_fn=worker_init_fn)
     if dataset_val:
-        val_dataloader = DataLoader(dataset_val, batch_size=batch_size, shuffle=False, num_workers=4,persistent_workers=True, worker_init_fn=worker_init_fn)
+        val_dataloader = DataLoader(dataset_val, batch_size=batch_size, shuffle=False, num_workers=0, worker_init_fn=worker_init_fn)
     
     wandb_name = f"{cfg.experiment.name}-{cfg.id}"
 
@@ -74,7 +82,9 @@ def train(cfg: DictConfig):
         logger=logger,
         log_every_n_steps=hp_config.log_every_n_steps,
         callbacks=[SaveBestModel()],
-        accumulate_grad_batches=accumulate_no_batches
+        accumulate_grad_batches=accumulate_no_batches,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
     )
 
     print(f"Starting training of model {cfg.id}")
@@ -83,6 +93,7 @@ def train(cfg: DictConfig):
     else:
         trainer.fit(model, train_dataloader)
     print(f"Training completed of model {cfg.id}")
+    os._exit(0) # To avoid hanging 
 
 def worker_init_fn(worker_id):
     info = torch.utils.data.get_worker_info()

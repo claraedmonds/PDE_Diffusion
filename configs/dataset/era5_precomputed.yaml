@@ -1,7 +1,7 @@
-name: era5
-path: ./data/era5/zarr/ 
-use_double: False
+name: era5_precomputed
+path: ./data/era5/precomputed
 time_series: True
+use_double: False
 validation_metrics: ['mse', 'era5_vorticity']
 test_metrics: [mse]
 dims:
@@ -16,10 +16,7 @@ atmospheric_features:
   - 'pv'
   - 't'
   - 'z'
-
 single_features: []
 static_features: []
 min_year: 2015
-max_year: 2025
-time_step: 1
-downsample_factor: 3
+max_year: 2022

@@ -7,12 +7,12 @@ Before running experiments on **Darcy Flow** generate the data using
 ```bash
 python src/pde_diff/data/darcy_data_generation.py
 ```
+## ERA5 data pipeline
+- For **ERA5**, use this script to download one datafile for each year data: ```python src/pde_diff/data/download_data.py```. NB! You must register to download the data, a guide is proviced in the script. Each zarr will contain three months' hourly data: January, February and December.
+- Process each zarr file into one large zarr file using ```merge_zarrs.sh```.
+- To speed up training, the zarr is precomputed into memory-mapped input/target arrays for training: an input tensor formed from the two preceding states, and a target tensor representing the next-step residual/change. This is done because the last two states are used to predict the following weather state. Note: triples crossing the February-December boundary are dropped as they are not time-coherent. Run the precomputation with ```precompute_dataset.sh```
+- You are now ready to start training, for example using ```train_tiny.sh``` or ```train_kfolds.sh```.
 
-Before running experiments on **ERA5** download the data using
-```bash
-python src/pde_diff/data/download_data.py
-```
-NB! You must register to download the data, a guide is proviced in the script.
 
 # 🚀 Experiments:
 
@@ -167,3 +167,16 @@ To use pre-commit checks run the following line:
 Created using [mlops_template](https://github.com/SkafteNicki/mlops_template),
 a [cookiecutter template](https://github.com/cookiecutter/cookiecutter) for getting
 started with Machine Learning Operations (MLOps).
+
+## Split
+### train & validation (k-folds)
+min_year: 2015
+max_year: 2022
+
+### test
+min_year: 2023
+max_year: 2024
+
+### experiments
+tiny_firstUNet3D_conditional : first run with correct model for ERA5! 
+baseline: 5-fold validation of model with hyperparameters as detailed in J&M thesis

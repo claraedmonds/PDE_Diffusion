@@ -262,7 +262,7 @@ class VorticityLoss(PDE_loss):
         except FileNotFoundError:
             self.residual_stats = None
 
-        nlat = 32  # hardcoded for now
+        nlat = 32  # hardcoded for now # TODO: this will vary with downsample factor
         nlon = 480  # hardcoded for now
 
         lats_deg = torch.linspace(self.lat_range[0],
