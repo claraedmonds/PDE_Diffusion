@@ -24,8 +24,12 @@ import torch
 from omegaconf import OmegaConf
 
 from pde_diff.model import DiffusionModel
+from pde_diff.spectra import plot_all_psd_variables
 from pde_diff.utils import DatasetRegistry
 import pde_diff.loss  # registers loss classes
+
+# TODO: read the true grid spacing from the dataset instead of hardcoding it.
+GRID_RESOLUTION_DEG = 0.75
 
 # Reuse plotting helpers from visualize.py where possible.
 # The module-level font/style setup in visualize.py may fail if times.ttf is
@@ -148,6 +152,22 @@ def plot_sample(pred: torch.Tensor, target: torch.Tensor,
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {path}")
+
+    # --- Power spectra (500 hPa) --------------------------------------------
+    gt_500 = np.stack([target_un[j * 3 + level_idx] for j in range(len(VARS))])
+    pred_500 = np.stack([pred_un[j * 3 + level_idx] for j in range(len(VARS))])
+    # TODO: use the dataset's actual latitude grid instead of the hardcoded
+    # GRID_RESOLUTION_DEG spacing.
+    fake_grid_lat = np.array([0.0, GRID_RESOLUTION_DEG])
+    psd_paths = plot_all_psd_variables(
+        ground_truth_state=gt_500,
+        predictions_by_model={f"sample_{sample_idx}_pred": pred_500},
+        grid_lat=fake_grid_lat,
+        var_names=VARS,
+        out_dir=out_dir / f"sample_{sample_idx}_psd",
+    )
+    for p in psd_paths:
+        print(f"  Saved {p}")
 
 
 # ---------------------------------------------------------------------------
