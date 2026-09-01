@@ -3,7 +3,6 @@ from torch.utils.data._utils.collate import default_collate
 import einops as ein
 import numpy as np
 import lightning as pl
-from diffusers import UNet2DModel, UNet2DConditionModel
 from omegaconf import OmegaConf
 from pathlib import Path
 
@@ -155,11 +154,6 @@ class DiffusionModel(pl.LightningModule):
         """For on_epoch_end validation metrics"""
         metrics = self.cfg.dataset.validation_metrics
         for metric_name in metrics:
-            if metric_name == "darcy":
-                with torch.no_grad():
-                    x0_preds = self.sample_loop(batch_size=16)
-                    darcy_res = self.loss_fn.compute_residual(x0_preds).mean().abs()
-                self.log("val_darcy_residual", darcy_res, prog_bar=True, on_epoch=True, sync_dist=True)
             if metric_name == 'era5_vorticity':
                 with torch.no_grad():
                     val_conditionals = self._uniform_val_batch(n=16)[0].to(self.device)
@@ -339,76 +333,3 @@ class UNet3DWrapperConditional(torch.nn.Module):
         conditionals = x[:, :cond_channels, :, :]
         inputs = x[:, cond_channels:, :, :]
         return self.unet(x = inputs, time = t, cond = conditionals)
-
-
-@ModelRegistry.register("unet2d")
-class UNet2DWrapper(torch.nn.Module):
-    def __init__(self, cfg_list):
-        super().__init__()
-        model_hp, hp_params = cfg_list[0], cfg_list[1]
-        in_channels = int(model_hp.dims.input_dims)
-        out_channels = int(model_hp.dims.output_dims)
-        self.unet = UNet2DModel(
-            sample_size=int(model_hp.dims.x),
-            in_channels=in_channels,
-            out_channels=out_channels,
-            dropout = hp_params.dropout,
-            layers_per_block=2,
-            block_out_channels=(64, 128, 256, 512),
-            down_block_types=(
-                "DownBlock2D",
-                "DownBlock2D",
-                "AttnDownBlock2D",
-                "DownBlock2D",
-            ),
-            up_block_types=(
-                "UpBlock2D",
-                "AttnUpBlock2D",
-                "UpBlock2D",
-                "UpBlock2D",
-            ),
-        )
-
-    def forward(self, x, t):
-        return self.unet(sample=x, timestep=t).sample
-
-@ModelRegistry.register("unet2d_conditional")
-class UNet2DConditionalWrapper(torch.nn.Module):
-    def __init__(self, cfg_list):
-        super().__init__()
-        model_hp, hp_params = cfg_list[0], cfg_list[1]
-        self.in_channels = int(model_hp.dims.input_dims)
-        self.out_channels = int(model_hp.dims.output_dims)
-        self.unet = UNet2DConditionModel(
-            sample_size=(int(model_hp.dims.x), int(model_hp.dims.y)),
-            in_channels=self.out_channels,
-            out_channels=self.out_channels,
-            dropout = hp_params.dropout,
-            layers_per_block=2,
-            block_out_channels=(64, 128, 256, 512),
-            down_block_types=(
-                "DownBlock2D",
-                "DownBlock2D",
-                "AttnDownBlock2D",
-                "DownBlock2D",
-            ),
-            up_block_types=(
-                "UpBlock2D",
-                "AttnUpBlock2D",
-                "UpBlock2D",
-                "UpBlock2D",
-            ),
-            cross_attention_dim=self.in_channels - self.out_channels,  # Assuming half of input channels are for conditioning
-        )
-
-    def forward(self, x, t):
-        # Split x into conditionals and actual input
-        cond_channels = self.in_channels - self.out_channels
-        conditionals = x[:, :cond_channels, :, :]
-        batch_size, cond_channels, height, width = conditionals.shape
-        conditionals = conditionals.view(batch_size, cond_channels, height * width).permute(0, 2, 1)
-        inputs = x[:, cond_channels:, :, :]
-        return self.unet(sample=inputs, timestep=t, encoder_hidden_states=conditionals).sample
-
-if __name__ == "__main__":
-    pass

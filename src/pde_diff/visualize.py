@@ -16,7 +16,6 @@ import torch
 
 from pde_diff.data.datasets import ERA5Dataset
 from pde_diff.model import DiffusionModel
-from pde_diff.loss import DarcyLoss
 from pde_diff.data.utils import split_dataset
 
 # Path to your TTF file
@@ -96,69 +95,6 @@ model_id_to_name={
         "c1e2_gw": r"$\mathcal{R}_2$: c=1e-2",
     }    
 
-def plot_darcy_samples(model_1, model_2, model_id, out_dir=Path("./reports/figures")):
-    save_dir = Path(out_dir) / model_id
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    cfg = OmegaConf.create({"c_residual": None})
-    loss = DarcyLoss(cfg)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    def generate(model):
-        samples = model.sample_loop(batch_size=1)
-        loss_samples = loss.compute_residual_field_for_plot(samples.to(device))
-
-        samples = samples.detach().cpu().numpy()
-        loss_samples = loss_samples.detach().cpu().numpy()
-        return samples, loss_samples
-
-    # --- 1) Generate both ---
-    samples1, res1 = generate(model_1)
-    samples2, res2 = generate(model_2)
-
-    # --- 2) Build a shared LogNorm for the residual plot (axs[2]) ---
-    # LogNorm requires strictly positive values; clamp zeros/negatives.
-    eps = 1e-12
-    r1 = np.clip(res1[0], eps, None)
-    r2 = np.clip(res2[0], eps, None)
-
-    shared_vmin = float(min(r1.min(), r2.min()))
-    shared_vmax = float(max(r1.max(), r2.max()))
-    shared_norm = LogNorm(vmin=shared_vmin, vmax=shared_vmax)
-
-    def plot_one(samples, res, tag):
-        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-
-        # Plot #1
-        im0 = axs[0].imshow(samples[0, 0], cmap="magma")
-        axs[0].set_title(r"Permeability - $K$")
-        axs[0].axis("off")
-        fig.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
-
-        # Plot #2
-        im1 = axs[1].imshow(np.rot90(samples[0, 1], k=3), cmap="magma")
-        axs[1].set_title(r"Pressure - $P$")
-        axs[1].axis("off")
-        fig.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
-
-        # Plot #3 (shared scale!)
-        res_plot = np.clip(res[0], eps, None)
-        breakpoint()
-        im2 = axs[2].imshow(res_plot, cmap="magma", norm=shared_norm)
-        axs[2].set_title(r"Residual - $\mathcal{R}_{\text{MAE}}$")
-        axs[2].axis("off")
-        fig.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
-
-        out_path = save_dir / f"samples_{tag}{PLOT_TYPE}"
-        plt.savefig(out_path, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved samples to {out_path}")
-
-    # --- 3) Plot two figures, same residual norm ---
-    plot_one(samples1, res1, tag="model1")
-    plot_one(samples2, res2, tag="model2")
-
 
 def plot_training_metrics(model_id, out_dir=Path("./reports/figures")):
     df = pd.read_csv(Path("./logs") / model_id / "version_0" / "metrics.csv").sort_values(["epoch", "step"])
@@ -169,7 +105,6 @@ def plot_training_metrics(model_id, out_dir=Path("./reports/figures")):
         ("train_loss", True,  "Train Loss vs Epoch"),
         ("val_loss", True,  "Validation Loss vs Epoch"),
         ("val_mse", False, "Validation MSE vs Epoch"),
-        ("val_darcy_residual", True, "Validation Darcy Residual vs Epoch"),
     ]
 
     for col, logy, title in metrics:
@@ -573,211 +508,6 @@ def _to_2d(x):
         raise ValueError(f"Expected 1D or 2D array-like, got shape {x.shape}")
     return x
 
-def plot_darcy_val_metrics(model_id_1, model_id_2, fold_num, log_path, out_dir, smooth_window=10):
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    from pathlib import Path
-
-    # --- Global styling tweaks (do NOT set figure.figsize here; we set it per-figure) ---
-    plt.rcParams.update({
-        "axes.grid": True,
-        "grid.alpha": 0.3,
-        "axes.titlesize": 13,
-        "axes.labelsize": 12,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-        "legend.fontsize": 10,
-    })
-
-    # Custom colour palette (different from default Matplotlib cycle)
-    diffusion_color = "#971A7C"
-    diffusion_ci    = "#ED63CF"
-    pidm_color      = "#BA090C"
-    pidm_ci         = "#F77C7E"
-    train_loss_pidm_color = "#0239C5"
-    train_loss_pidm_ci    = "#3B60BE"
-    val_loss_pidm_color   = "#028EC5"
-    val_loss_pidm_ci      = "#4497B8"
-    train_loss_diff_color = "#E2901C"
-    train_loss_diff_ci    = "#D19541"
-    val_loss_diff_color   = "#D17321"
-    val_loss_diff_ci      = "#CE9563"
-
-    def moving_average_2d(arr, window):
-        """Apply moving average along the time axis for a 2D array [fold, time]."""
-        if window <= 1:
-            return arr
-        kernel = np.ones(window) / window
-        return np.apply_along_axis(
-            lambda m: np.convolve(m, kernel, mode="valid"), axis=1, arr=arr
-        )
-
-    def _load_model_stats(model_id, smooth_window=1):
-        residual_errors = []
-        weighted_mse_errors = []
-        train_loss = []
-        val_loss = []
-        steps = None
-
-        for fold in range(1, fold_num + 1):
-            current_model_id = f"{model_id}-{fold}"
-            csv_path = Path(log_path) / current_model_id / "version_0" / "metrics.csv"
-
-            df = (
-                pd.read_csv(csv_path)
-                .apply(pd.to_numeric, errors="ignore")
-                .dropna(subset=["step"])
-                .sort_values("step")
-            )
-
-            if steps is None:
-                steps = df["step"].values
-
-            residual_errors.append(df["val_darcy_residual"].dropna().values)
-            weighted_mse_errors.append(df["val_mse_(weighted)"].dropna().values)
-            train_loss.append(df["train_loss"].dropna().values)
-            val_loss.append(df["val_loss"].dropna().values)
-
-        residual_errors = np.array(residual_errors)      # shape: [fold, time]
-        weighted_mse_errors = np.array(weighted_mse_errors)
-        train_loss = np.array(train_loss)
-        val_loss = np.array(val_loss)
-
-        # --- Smooth over time (epochs) ---
-        residual_errors = moving_average_2d(residual_errors, smooth_window)
-        weighted_mse_errors = moving_average_2d(weighted_mse_errors, smooth_window)
-        train_loss = moving_average_2d(train_loss, smooth_window)
-        val_loss = moving_average_2d(val_loss, smooth_window)
-
-        n = residual_errors.shape[0]
-
-        res_mean = residual_errors.mean(axis=0)
-        res_std = residual_errors.std(axis=0)
-        res_low = res_mean - 1.96 * res_std / np.sqrt(n)
-        res_high = res_mean + 1.96 * res_std / np.sqrt(n)
-
-        mse_mean = weighted_mse_errors.mean(axis=0)
-        mse_std = weighted_mse_errors.std(axis=0)
-        mse_low = mse_mean - 1.96 * mse_std / np.sqrt(n)
-        mse_high = mse_mean + 1.96 * mse_std / np.sqrt(n)
-
-        train_loss_mean = train_loss.mean(axis=0)
-        train_loss_std = train_loss.std(axis=0)
-        val_loss_mean = val_loss.mean(axis=0)
-        val_loss_std = val_loss.std(axis=0)
-
-        train_loss_low = train_loss_mean - 1.96 * train_loss_std / np.sqrt(n)
-        train_loss_high = train_loss_mean + 1.96 * train_loss_std / np.sqrt(n)
-        val_loss_low = val_loss_mean - 1.96 * val_loss_std / np.sqrt(n)
-        val_loss_high = val_loss_mean + 1.96 * val_loss_std / np.sqrt(n)
-
-        epochs = res_mean.shape[0]
-
-        return {
-            "epochs": epochs,
-            "res_mean": res_mean,
-            "res_low": res_low,
-            "res_high": res_high,
-            "mse_mean": mse_mean,
-            "mse_low": mse_low,
-            "mse_high": mse_high,
-            "train_loss_mean": train_loss_mean,
-            "train_loss_low": train_loss_low,
-            "train_loss_high": train_loss_high,
-            "val_loss_mean": val_loss_mean,
-            "val_loss_low": val_loss_low,
-            "val_loss_high": val_loss_high,
-        }
-
-    # ---------------- Output folder ----------------
-    out_dir = Path(out_dir)
-    plot_folder = out_dir / f"{model_id_1}_vs_{model_id_2}_darcy_val_metrics"
-    plot_folder.mkdir(parents=True, exist_ok=True)
-
-    stats1 = _load_model_stats(model_id_1, smooth_window)
-    stats2 = _load_model_stats(model_id_2, smooth_window)
-
-    epochs = min(stats1["epochs"], stats2["epochs"])
-    x = np.arange(epochs)
-
-    def save_fig(fig, filename):
-        path = plot_folder / filename
-        fig.savefig(path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved: {path}")
-
-    # ---------------- Plot 1: Residual ----------------
-    fig, ax = plt.subplots(figsize=(4.1, 4.1))
-
-    ax.plot(x, stats1["res_mean"][:epochs], label="Diffusion mean", linewidth=2.2, color=diffusion_color)
-    ax.fill_between(x, stats1["res_low"][:epochs], stats1["res_high"][:epochs],
-                    alpha=0.3, color=diffusion_ci, label="Diffusion 95% CI")
-
-    ax.plot(x, stats2["res_mean"][:epochs], label="PIDM mean", linewidth=2.2, color=pidm_color)
-    ax.fill_between(x, stats2["res_low"][:epochs], stats2["res_high"][:epochs],
-                    alpha=0.3, color=pidm_ci, label="PIDM 95% CI")
-
-    ax.set_xlabel(f"Epochs")
-    ax.set_ylabel(r"$\mathcal{R}_{\text{MAE}}(\mathbf{x_0}) \sim p_\theta (\mathbf{x_0})$")
-    ax.set_title("Darcy Sample Residual MAE")
-    ax.set_yscale("log")
-    ax.legend(frameon=True, fancybox=True, framealpha=0.9, loc="upper right")
-    fig.tight_layout()
-    save_fig(fig, "01_val_darcy_residual.png")
-
-    # ---------------- Plot 2: Weighted MSE ----------------
-    fig, ax = plt.subplots(figsize=(4.1, 4.1))
-
-    ax.plot(x, stats1["mse_mean"][:epochs], label="Diffusion mean", linewidth=2.2, color=diffusion_color)
-    ax.fill_between(x, stats1["mse_low"][:epochs], stats1["mse_high"][:epochs],
-                    alpha=0.3, color=diffusion_ci, label="Diffusion 95% CI")
-
-    ax.plot(x, stats2["mse_mean"][:epochs], label="PIDM mean", linewidth=2.2, color=pidm_color)
-    ax.fill_between(x, stats2["mse_low"][:epochs], stats2["mse_high"][:epochs],
-                    alpha=0.3, color=pidm_ci, label="PIDM 95% CI")
-
-    ax.set_xlabel(f"Epochs")
-    ax.set_ylabel(r"$\mathbb{E}_{t, \mathbf{x_0}}[\lambda_t \|\mathbf{x_0} - \hat{\mathbf{x}}_0 (\mathbf{x}_t,t) \|^2]$")
-    ax.set_title("Validation Weighted MSE")
-    ax.set_yscale("log")
-    ax.legend(frameon=True, fancybox=True, framealpha=0.9, loc="upper right")
-    fig.tight_layout()
-    save_fig(fig, "02_val_weighted_mse.png")
-
-    # ---------------- Plot 3: Train vs Val loss ----------------
-    fig, ax = plt.subplots(figsize=(4.1, 4.1))
-
-    # Diffusion
-    ax.plot(x, stats1["train_loss_mean"][:epochs], label="Train loss mean (Diffusion)", linewidth=2.2, color=train_loss_diff_color)
-    ax.fill_between(x, stats1["train_loss_low"][:epochs], stats1["train_loss_high"][:epochs],
-                    alpha=0.3, color=train_loss_diff_ci, label="Train loss 95% CI (Diffusion)")
-
-    ax.plot(x, stats1["val_loss_mean"][:epochs], label="Val loss mean (Diffusion)", linewidth=2.2, color=val_loss_diff_color)
-    ax.fill_between(x, stats1["val_loss_low"][:epochs], stats1["val_loss_high"][:epochs],
-                    alpha=0.3, color=val_loss_diff_ci, label="Val loss 95% CI (Diffusion)")
-
-    # PIDM
-    ax.plot(x, stats2["train_loss_mean"][:epochs], label="Train loss mean (PIDM)", linewidth=2.2, color=train_loss_pidm_color)
-    ax.fill_between(x, stats2["train_loss_low"][:epochs], stats2["train_loss_high"][:epochs],
-                    alpha=0.3, color=train_loss_pidm_ci, label="Train loss 95% CI (PIDM)")
-
-    ax.plot(x, stats2["val_loss_mean"][:epochs], label="Val loss mean (PIDM)", linewidth=2.2, color=val_loss_pidm_color)
-    ax.fill_between(x, stats2["val_loss_low"][:epochs], stats2["val_loss_high"][:epochs],
-                    alpha=0.3, color=val_loss_pidm_ci, label="Val loss 95% CI (PIDM)")
-
-    ax.set_xlabel(f"Epochs")
-    ax.set_ylabel(
-        r"$\mathbb{E}_{t, \mathbf{x_0}}[\lambda_t \|\mathbf{x_0} - \hat{\mathbf{x}}_0 (\mathbf{x}_t,t) \|^2] + "
-        r"\frac{1}{2 \tilde{\Sigma}} || \mathcal{R}(\mathbf{x}_0^*(\mathbf{x}_t,t))||^2$"
-    )
-    ax.set_title("Train vs Validation loss")
-    ax.set_yscale("log")
-    ax.legend(frameon=True, fancybox=True, framealpha=0.9, loc="upper right")
-    fig.tight_layout()
-    save_fig(fig, "03_train_vs_val_loss.png")
-
-
 def moving_average_2d(arr, window):
     """Apply moving average along the time axis for a 2D array [fold, time]."""
     if window <= 1:
@@ -850,13 +580,11 @@ def load_model_stats(
 
         steps = df["step"].values if steps is None else steps
 
-        # residual_errors: ERA5 sum if ALL exist; else Darcy if exists; else nothing
+        # residual_errors: ERA5 sum if ALL exist;else nothing
         if all(c in df.columns for c in era5_cols):
             tmp = df[era5_cols].dropna(how="any").sum(axis=1).values
             if len(tmp) > 0:
                 residual_errors.append(tmp)
-        else:
-            append_if(df, "val_darcy_residual", residual_errors)
 
         # sampled residuals (append only if column exists)
         for col, target in sample_cols.items():
@@ -1603,14 +1331,12 @@ def era5_residuals_plot(model, conditional, model_id, normalize=True):
 
 if __name__ == "__main__":
     from pde_diff.utils import DatasetRegistry, LossRegistry
-    plot_darcy = False
     plot_data_samples = True
     plot_era5_training = False
     plot_era5_residual = False
     plot_era5_residual_metrics = False
     plot_era5_individual_var_mse = False
     era5_latex = False
-    plot_darcy_sample = False
 
     model_path = Path('./models')
     model_ids = ['era5_clean_hp3-baseline-retrain-retrain','era5_clean_hp3-c1e2_pv-retrain-retrain']
@@ -1675,37 +1401,6 @@ if __name__ == "__main__":
             prefix = 'ne_'
         )
 
-    if plot_darcy:
-        model_path = Path('./models')
-        model_id = 'era5_cleanhp_50e-bqlmk'
-        model_id_2 = 'era5_cleanhp_50e-hgrnf'
-
-        plot_darcy_val_metrics(
-            model_id_1=model_id,
-            model_id_2=model_id_2,
-            fold_num=5,
-            log_path="logs",
-            out_dir=f"reports/figures/{model_id}",
-            smooth_window=20,
-        )
-
-        cfg = OmegaConf.load(model_path / model_id / "config.yaml")
-        dataset = DatasetRegistry.create(cfg.dataset)
-        diffusion_model = DiffusionModel(cfg)
-        diffusion_model.load_model(model_path / model_id / f"best-val_loss-weights.pt")
-        diffusion_model = diffusion_model.to('cuda' if torch.cuda.is_available() else 'cpu')
-
-    if plot_darcy_sample:
-        model_path = Path('./models')
-        model_id_1 = 'exp1-aaaaa-1'
-        cfg_1 = OmegaConf.load(model_path / model_id_1 / "config.yaml")
-        model_id_2 = 'exp1-dp'
-        cfg_2 = OmegaConf.load(model_path / model_id_2 / "config.yaml")
-        diffusion_model_1 = DiffusionModel(cfg_1)
-        diffusion_model_1.load_model(model_path / model_id_1 / f"best-val_loss-weights.pt")
-        diffusion_model_2 = DiffusionModel(cfg_2)
-        diffusion_model_2.load_model(model_path / model_id_2 / f"best-val_loss-weights.pt")
-        plot_darcy_samples(diffusion_model_1, diffusion_model_2, model_id_2, Path('./reports/figures') / model_id_2)
 
     if era5_latex:
         pretty = {

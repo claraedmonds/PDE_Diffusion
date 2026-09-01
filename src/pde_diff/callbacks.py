@@ -1,4 +1,3 @@
-from pde_diff.loss import DarcyLoss
 import torch.nn as nn
 import torch
 from lightning.pytorch.callbacks import Callback
