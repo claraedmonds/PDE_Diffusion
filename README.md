@@ -1,11 +1,7 @@
 # Physics Constrained Diffusion Models for Weather Forecasting
 
-This is a repository for a Master Thesis and it implements physics‑constrained diffusion models for weather forecasting and related PDE problems. It provides training pipelines, evaluation scripts, hyperparameter tuning utilities, and visualization helpers for the ERA5 and Darcy Flow tasks. Use the configs directory and Hydra-style overrides to reproduce experiments or run new trials.
+This is a repository for a Master Thesis and it implements physics‑constrained diffusion models for weather forecasting and related PDE problems. It provides training pipelines, evaluation scripts, hyperparameter tuning utilities, and visualization helpers for the ERA5 tasks. Use the configs directory and Hydra-style overrides to reproduce experiments or run new trials.
 
-# :fire: Data generation
-Before running experiments on **Darcy Flow** generate the data using 
-```bash
-python src/pde_diff/data/darcy_data_generation.py
 ```
 ## ERA5 data pipeline
 - For **ERA5**, use this script to download one datafile for each year data: ```python src/pde_diff/data/download_data.py```. NB! You must register to download the data, a guide is proviced in the script. Each zarr will contain three months' hourly data: January, February and December.
@@ -16,11 +12,6 @@ python src/pde_diff/data/darcy_data_generation.py
 
 # 🚀 Experiments:
 
-To train the model on the **Darcy dataset** with physical regularization, run:
-
-```bash
-python src/pde_diff/train.py dataset=darcy loss.name=darcy
-```
 
 To train the model on the **ERA5** with physical regularization, run:
 ```bash
@@ -30,9 +21,9 @@ To train without regularization set `loss.c_residual=0`. The residual validation
 
 ## **Training Options**
 
-- **`dataset:`** : Choose dataset to train on. Examples: `dataset=darcy`, `dataset=era5`.
+- **`dataset:`** : Choose dataset to train on. Examples: `dataset=era5`.
 - **`model.name:`** : Model architecture. Example: `model.name=unet3d_conditional`.
-- **`loss.name:`** : Loss configuration. Examples: `loss.name=mse`, `loss.name=vorticity`, `loss.name=darcy`.
+- **`loss.name:`** : Loss configuration. Examples: `loss.name=mse`, `loss.name=vorticity`,
 - **`loss.c_residual:`** : Physical-regularization strength (float). Example: `loss.c_residual=1e-2` to enable a small PDE constraint. For ERA5 one can chose residual specific weights, e.g., `loss.c_residual=[1e-2,0]` to only use the planetary vorticity residual.
 - **Other overrides:** Hydra-style overrides are supported — any field from `configs/` may be overridden on the command line (e.g. `configs/dataset/era5.yaml`).
 
