@@ -6,5 +6,9 @@
   "planetary_vorticity": {
     "mean": -4.848370269946745e-12,
     "std": 3.450180093230313e-09
+  },
+    "vorticity_divergence": {
+    "mean": -6.495007757771314e-12,
+    "std": 3.6010111192533456e-09
   }
 }

@@ -79,6 +79,7 @@ if __name__ == "__main__":
         hist_data = {
             "geostrophic_wind": [],
             "planetary_vorticity": [],
+            "vorticity_divergence": [],
         }
         hist_data_noise = {
             "geostrophic_wind_noise": [],
@@ -92,6 +93,7 @@ if __name__ == "__main__":
         residual_stats = {
             "geostrophic_wind": {"count": 0, "sum": 0.0, "sumsq": 0.0},
             "planetary_vorticity": {"count": 0, "sum": 0.0, "sumsq": 0.0},
+            "vorticity_divergence": {"count": 0, "sum": 0.0, "sumsq": 0.0},
         }
 
         with torch.no_grad():
@@ -107,6 +109,7 @@ if __name__ == "__main__":
                 # Compute residuals (NOT normalized)
                 r_gw = loss_fn.compute_residual_geostrophic_wind(prev, curr, normalize=False)
                 r_pv = loss_fn.compute_residual_planetary_vorticity(prev, curr, normalize=False)
+                r_vd = loss_fn.compute_residual_vorticity_divergence(prev, curr, normalize=False)
                 rel_gw = loss_fn.compute_residual_geostrophic_wind(prev, curr, normalize=False, relative=True)
 
                 # Compute residuals with noise (NOT normalized)
@@ -114,7 +117,7 @@ if __name__ == "__main__":
                 r_gw_noise = loss_fn.compute_residual_geostrophic_wind(prev_noise, curr_noise, normalize=False)
                 r_pv_noise = loss_fn.compute_residual_planetary_vorticity(prev_noise, curr_noise, normalize=False)
 
-                for key, r in (("geostrophic_wind", r_gw), ("planetary_vorticity", r_pv)):
+                for key, r in (("geostrophic_wind", r_gw), ("planetary_vorticity", r_pv), ("vorticity_divergence", r_vd)):
                     s = residual_stats[key]
                     s["count"] += r.numel()
                     s["sum"] += r.sum().item()
@@ -122,6 +125,7 @@ if __name__ == "__main__":
 
                 append_hist(r_gw, hist_data["geostrophic_wind"], MAX_SAMPLES)
                 append_hist(r_pv, hist_data["planetary_vorticity"], MAX_SAMPLES)
+                append_hist(r_vd, hist_data["vorticity_divergence"], MAX_SAMPLES)
 
                 append_hist(rel_gw[0],relative_wind_hist["geostrophic_wind_relative_error_u"],MAX_SAMPLES)
                 append_hist(rel_gw[1],relative_wind_hist["geostrophic_wind_relative_error_v"],MAX_SAMPLES)
@@ -129,7 +133,7 @@ if __name__ == "__main__":
                 append_hist(r_gw_noise, hist_data_noise["geostrophic_wind_noise"], MAX_SAMPLES)
                 append_hist(r_pv_noise, hist_data_noise["planetary_vorticity_noise"], MAX_SAMPLES)
 
-                del prev, curr, r_gw, r_pv, prev_noise, curr_noise, r_gw_noise, r_pv_noise
+                del prev, curr, r_gw, r_pv, r_vd, prev_noise, curr_noise, r_gw_noise, r_pv_noise
 
         results = {}
         for key, s in residual_stats.items():

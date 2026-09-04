@@ -79,7 +79,8 @@ class ForecastBias(nn.Module):
 class VorticityLoss(PDE_loss):
     def __init__(self, cfg):
         residual_fns = [self.compute_residual_planetary_vorticity,
-                        self.compute_residual_geostrophic_wind]
+                        self.compute_residual_geostrophic_wind,
+                        self.compute_residual_vorticity_divergence]
         self.cfg = cfg
         device_str = OmegaConf.select(cfg, "device", default=None)
         self.device = torch.device(device_str) if device_str else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -260,6 +261,38 @@ class VorticityLoss(PDE_loss):
             residual = self._normalize(residual, 'planetary_vorticity')
         return residual
 
+    def compute_residual_vorticity_divergence(self, x0_previous, x0_change_pred, normalize=True):
+        """
+        Residual of the barotropic vorticity-divergence equation (see Equations.md).
+
+        :param self: Description
+        :param x0_previous: Description
+        :param x0_change_pred: Description
+        """
+        previous, current = self.get_original_states(x0_previous, x0_change_pred)
+
+        num_vars = current.shape[2]
+        wind_u_p, wind_v_p, _, temp_p, geo_p = [previous[:, :, i] for i in range(num_vars)]
+        wind_u_c, wind_v_c, _, temp_c, geo_c = [current[:, :, i] for i in range(num_vars)]
+
+        du_dx_c, du_dy_c = self.gradient_helper.gradient_horizontal(wind_u_c)
+        dv_dx_c, dv_dy_c = self.gradient_helper.gradient_horizontal(wind_v_c)
+        zeta_c = dv_dx_c - du_dy_c
+        delta_c = du_dx_c + dv_dy_c
+
+        du_dy_p = self.gradient_helper.d_in_dy(wind_u_p)
+        dv_dx_p = self.gradient_helper.d_in_dx(wind_v_p)
+        zeta_p = dv_dx_p - du_dy_p
+
+        dzeta_dt = (zeta_c - zeta_p) / self.dt
+
+        dzeta_dx_c, dzeta_dy_c = self.gradient_helper.gradient_horizontal(zeta_c)
+
+        residual = dzeta_dt + wind_u_c * dzeta_dx_c + wind_v_c * dzeta_dy_c + (zeta_c + self.f) * delta_c
+        if normalize:
+            residual = self._normalize(residual, 'vorticity_divergence')
+        return residual
+
     def get_q(self, x0_previous, x0_change_pred):
         previous, current = self.get_original_states(x0_previous, x0_change_pred)
         num_vars = current.shape[2]
@@ -370,11 +403,13 @@ if __name__ == "__main__":
 
     r_era5_pv = loss.compute_residual_planetary_vorticity(previous, current, normalize=False).abs().mean()
     r_era5_geo_wind = loss.compute_residual_geostrophic_wind(previous, current, normalize=False).abs().mean()
+    r_era5_vd = loss.compute_residual_vorticity_divergence(previous, current, normalize=False).abs().mean()
 
     random_prev = torch.randn_like(previous)
     random_curr = torch.randn_like(current)
     r_rand_pv = loss.compute_residual_planetary_vorticity(random_prev, random_curr, normalize=False).abs().mean()
     r_rand_geo_wind = loss.compute_residual_geostrophic_wind(random_prev, random_curr, normalize=False).abs().mean()
+    r_rand_vd = loss.compute_residual_vorticity_divergence(random_prev, random_curr, normalize=False).abs().mean()
 
     print("_______________")
     print("ERA5 residual planetary:", r_era5_pv.item())
@@ -382,16 +417,21 @@ if __name__ == "__main__":
     print("_______________")
     print("ERA5 residual geo wind:", r_era5_geo_wind.item())
     print("Random residual geo wind:", r_rand_geo_wind.item())
+    print("_______________")
+    print("ERA5 residual vorticity-divergence:", r_era5_vd.item())
+    print("Random residual vorticity-divergence:", r_rand_vd.item())
 
     # ERA5 (normalized)
     r_era5_pv_norm = (loss.compute_residual_planetary_vorticity(previous, current, normalize=True).abs().mean())
     r_era5_geo_wind = (loss.compute_residual_geostrophic_wind(previous, current, normalize=True).abs().mean())
+    r_era5_vd_norm = (loss.compute_residual_vorticity_divergence(previous, current, normalize=True).abs().mean())
 
     random_prev = torch.randn_like(previous)
     random_curr = torch.randn_like(current)
 
     r_rand_pv_norm = (loss.compute_residual_planetary_vorticity(random_prev, random_curr, normalize=True).abs().mean())
     r_rand_geo_wind = (loss.compute_residual_geostrophic_wind(random_prev, random_curr, normalize=True).abs().mean())
+    r_rand_vd_norm = (loss.compute_residual_vorticity_divergence(random_prev, random_curr, normalize=True).abs().mean())
 
     print("_______________")
     print("ERA5 residual planetary (normalized):", r_era5_pv_norm.item())
@@ -400,3 +440,6 @@ if __name__ == "__main__":
     print("_______________")
     print("ERA5 residual geo wind:", r_era5_geo_wind.item())
     print("Random residual geo wind:", r_rand_geo_wind.item())
+    print("_______________")
+    print("ERA5 residual vorticity-divergence (normalized):", r_era5_vd_norm.item())
+    print("Random residual vorticity-divergence (normalized):", r_rand_vd_norm.item())

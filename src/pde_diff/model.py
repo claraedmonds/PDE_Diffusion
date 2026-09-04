@@ -135,8 +135,10 @@ class DiffusionModel(pl.LightningModule):
                     x0_change_pred = x0_hat[:, num_channels//2:, :, :]
                     residual_planetary = self.loss_fn.compute_residual_planetary_vorticity(x0_previous, x0_change_pred).abs().mean()
                     residual_geo_wind = self.loss_fn.compute_residual_geostrophic_wind(x0_previous, x0_change_pred).abs().mean()
+                    residual_vort_div = self.loss_fn.compute_residual_vorticity_divergence(x0_previous, x0_change_pred).abs().mean()
                     self.log("val_era5_planetary_residual(norm)", residual_planetary, prog_bar=True, on_step=False, on_epoch=True, batch_size=model_out.size(0))
                     self.log("val_era5_geo_wind_residual(norm)", residual_geo_wind, prog_bar=True, on_step=False, on_epoch=True, batch_size=model_out.size(0))
+                    self.log("val_era5_vort_div_residual(norm)", residual_vort_div, prog_bar=True, on_step=False, on_epoch=True, batch_size=model_out.size(0))
 
                     model_out_reshaped = ein.rearrange(model_out, "b (var lev) lon lat -> b lev var lon lat", lev = 3)
                     target_reshaped = ein.rearrange(target, "b (var lev) lon lat -> b lev var lon lat", lev = 3)
@@ -162,8 +164,10 @@ class DiffusionModel(pl.LightningModule):
                     x0_prev = val_conditionals[:, num_vars*3+4:-4]
                     residual_planetary = self.loss_fn.compute_residual_planetary_vorticity(x0_prev, x0_preds).abs().mean()
                     residual_geo_wind = self.loss_fn.compute_residual_geostrophic_wind(x0_prev, x0_preds).abs().mean()
+                    residual_vort_div = self.loss_fn.compute_residual_vorticity_divergence(x0_prev, x0_preds).abs().mean()
                 self.log("val_era5_sampled_planetary_residual(norm)", residual_planetary, prog_bar=True, on_epoch=True, sync_dist=True)
                 self.log("val_era5_sampled_geo_wind_residual(norm)", residual_geo_wind, prog_bar=True, on_epoch=True, sync_dist=True)
+                self.log("val_era5_sampled_vort_div_residual(norm)", residual_vort_div, prog_bar=True, on_epoch=True, sync_dist=True)
 
     def _uniform_val_batch(self, n=16):
         vdl = self.trainer.val_dataloaders
