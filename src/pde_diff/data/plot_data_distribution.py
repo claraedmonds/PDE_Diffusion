@@ -341,7 +341,7 @@ if __name__ == "__main__":
         levels = ["450hPa","500hPa","550hPa"]
         hist_data = {str(j): {str(k):[] for k,lvl in enumerate(levels)} for j,var in enumerate(vars)}
 
-        from pde_diff.visualize import VAR_NAMES, VAR_UNITS
+        from pde_diff.eval_primitives import VAR_NAMES, VAR_UNITS
         colors = ["#2A9D8F", "#E76F51", "#1A4DAC"]
 
         

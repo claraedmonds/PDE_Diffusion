@@ -29,7 +29,7 @@ python src/pde_diff/train.py \
     dataset.min_year=2015 \
     dataset.max_year=2022 \
     loss.name=vorticity \
-    loss.c_residual=0 \
+    loss.c_residual=[1e-2,0,1e-2] \
     model.name=unet3d_conditional \
     model.save_best_model=True \
     wandb=False \

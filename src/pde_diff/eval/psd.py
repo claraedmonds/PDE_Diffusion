@@ -2,22 +2,17 @@
 Radial power-spectral-density (PSD) computation and plotting for comparing
 ERA5 ground truth vs. one or more trained models' forecasts, at 500 hPa.
 
-Called from evaluate.py's evaluate_forecasting() via plot_all_psd_variables().
+All variables are drawn onto a single figure (one subplot per variable)
+rather than one PNG per variable.
 """
 from pathlib import Path
 
 import numpy as np
 from scipy.fft import fft2, fftfreq
-
-try:
-    from pde_diff.visualize import PLOT_TYPE, pidm_colors, diffusion_colors, model_id_to_name
-except Exception:
-    PLOT_TYPE = ".png"
-    pidm_colors = {}
-    diffusion_colors = ("#8800FF", "#5900A7")
-    model_id_to_name = {}
-
 import matplotlib.pyplot as plt
+
+from pde_diff.eval_primitives import PLOT_TYPE
+from pde_diff.eval.palette import get_model_color
 
 EARTH_RADIUS_KM = 6371.0088
 DEG_TO_KM = np.pi / 180.0 * EARTH_RADIUS_KM  # ~111.32 km/deg
@@ -32,10 +27,6 @@ def radial_psd(field: np.ndarray, dx_km: float) -> tuple[np.ndarray, np.ndarray]
     broadband power into every wavenumber bin (spectral leakage) — this masks
     real high-wavenumber differences between fields (e.g. it can make a
     heavily-blurred field's PSD look nearly identical to the unblurred one).
-
-    No land-crop/region argument: unlike the reference implementation this is
-    adapted from, the ERA5 crop used in this repo has no land to avoid, so the
-    full field passed in is used directly.
 
     Parameters
     ----------
@@ -89,8 +80,7 @@ def radial_psd_wavelength(field: np.ndarray, dx_km: float) -> tuple[np.ndarray, 
 def compute_dx_km(grid_lat: np.ndarray) -> float:
     """
     Isotropic grid spacing [km] derived from the actual latitude spacing of
-    the dataset (not hardcoded, so it stays correct if downsample_factor
-    changes). The ERA5 crop is a regular lat-lon grid, not equal-area, so
+    the dataset. The ERA5 crop is a regular lat-lon grid, not equal-area, so
     longitude spacing shrinks with cos(latitude); using the (constant)
     latitude-direction spacing for both FFT axes is an approximation. This
     only affects the absolute km/wavelength calibration on the x-axis — since
@@ -118,52 +108,31 @@ def compute_psd_curves(
     return curves
 
 
-def _color_for_model(label: str, model_idx: int) -> str:
-    if label in pidm_colors:
-        return pidm_colors[label]
-    if model_idx == 0:
-        return diffusion_colors[0]
-    tab10 = plt.get_cmap("tab10")
-    return tab10(model_idx % 10)
-
-
-def plot_psd_comparison(
+def plot_psd_comparison_on_axis(
+    ax,
     curves: dict[str, tuple[np.ndarray, np.ndarray]],
     variable: str,
-    out_dir: Path,
-) -> Path:
-    """One log-log PSD figure overlaying ground truth (black) and every model
-    in `curves` (colors from the existing repo palettes where recognized,
-    otherwise a tab10 fallback cycle). Saves to out_dir/psd_<variable>.png."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-
+    model_labels: list[str] | None = None,
+) -> None:
+    """Draw one variable's PSD comparison (ground truth + every model in
+    `curves`) onto a given Axes."""
     wl_gt, psd_gt = curves["ground_truth"]
     ax.loglog(wl_gt, psd_gt, color="black", lw=1.8, label="ERA5 (ground truth)")
 
-    model_idx = 0
-    for label, (wl, psd) in curves.items():
-        if label == "ground_truth":
-            continue
-        color = _color_for_model(label, model_idx)
-        legend_label = model_id_to_name.get(label, label)
-        ax.loglog(wl, psd, color=color, lw=1.5, label=legend_label)
-        model_idx += 1
+    if model_labels is None:
+        model_labels = [label for label in curves if label != "ground_truth"]
+    n_models = len(model_labels)
+
+    for model_idx, label in enumerate(model_labels):
+        wl, psd = curves[label]
+        color = get_model_color(model_idx, n_models)
+        ax.loglog(wl, psd, color=color, lw=1.5, label=label)
 
     ax.set_xlabel("Wavelength (km)")
     ax.set_ylabel("Power spectral density")
-    ax.set_title(f"PSD — {variable} (500 hPa)")
+    ax.set_title(f"{variable} (500 hPa)")
     ax.invert_xaxis()  # large scales on the left, small scales (blurring) on the right
-    ax.legend(fontsize=8)
     ax.grid(True, which="both", alpha=0.3)
-    fig.tight_layout()
-
-    path = out_dir / f"psd_{variable}{PLOT_TYPE}"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return path
 
 
 def plot_all_psd_variables(
@@ -172,18 +141,36 @@ def plot_all_psd_variables(
     grid_lat: np.ndarray,
     var_names: list[str],
     out_dir: Path,
-) -> list[Path]:
+) -> Path:
     """
     ground_truth_state   : (var, lon, lat) physical-unit field at 500 hPa.
     predictions_by_model : {model_id: (var, lon, lat)}, same shape.
 
-    Computes dx_km once from grid_lat and produces one PSD comparison PNG per
-    variable (len(var_names) files total).
+    Computes dx_km once from grid_lat and produces one figure with a subplot
+    per variable (`len(var_names)` panels total), saved as a single PNG.
     """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     dx_km = compute_dx_km(grid_lat)
-    paths = []
+    model_labels = list(predictions_by_model.keys())
+
+    n_vars = len(var_names)
+    fig, axes = plt.subplots(1, n_vars, figsize=(5 * n_vars, 4.5))
+    if n_vars == 1:
+        axes = [axes]
+
     for j, var in enumerate(var_names):
         preds = {model_id: arr[j] for model_id, arr in predictions_by_model.items()}
         curves = compute_psd_curves(ground_truth_state[j], preds, dx_km)
-        paths.append(plot_psd_comparison(curves, var, out_dir))
-    return paths
+        plot_psd_comparison_on_axis(axes[j], curves, var, model_labels=model_labels)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 5), bbox_to_anchor=(0.5, -0.05))
+    fig.suptitle("Power spectral density")
+    fig.tight_layout()
+
+    path = out_dir / f"psd_all_variables{PLOT_TYPE}"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
