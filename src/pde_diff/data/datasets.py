@@ -210,29 +210,40 @@ class ERA5Dataset(Dataset):
     def __len__(self):
         return sum(self.data["time.year"].values <= self.max_year) - 2 * self.time_step
 
-    def __getitem__(self, item):
-        ds_conditionals = self.data.isel(time=[item, item + self.time_step])
-        ds_state = self.data.isel(time=item + 2 * self.time_step)
-
-        # Load inputs data
-        ds_conditionals_atm = (
-            ds_conditionals[self.atmospheric_features]
+    def _extract_states(self, ds) -> np.ndarray:
+        """Raw (unnormalised) time-varying state channels of `ds` (which must
+        keep its `time` dim), ordered atmospheric `(var lev)` then single
+        features: shape (T, output_features_dim, lon, lat)."""
+        atm = (
+            ds[self.atmospheric_features]
             .to_array()
             .transpose("time", "longitude", "latitude", "isobaricInhPa", "variable")
             .values
         )
-        ds_conditionals_atm = einops.rearrange(ds_conditionals_atm, "t lon lat lev var -> t  (var lev) lon lat")
-        raw_inputs = ds_conditionals_atm
-
+        states = einops.rearrange(atm, "t lon lat lev var -> t (var lev) lon lat")
         if self.single_features:
-            ds_conditionals_single = (
-                ds_conditionals[self.single_features]
+            single = (
+                ds[self.single_features]
                 .to_array()
                 .transpose("time", "longitude", "latitude", "variable")
                 .values
             )
-            ds_conditionals_single = einops.rearrange(ds_conditionals_single, "t lon lat var -> t var lon lat")
-            raw_inputs = np.concatenate([raw_inputs, ds_conditionals_single], axis=1)
+            single = einops.rearrange(single, "t lon lat var -> t var lon lat")
+            states = np.concatenate([states, single], axis=1)
+        return states
+
+    def raw_states(self, time_idx) -> np.ndarray:
+        """Raw state channels at `time_idx` (list/slice of time indices) with
+        the exact channel layout used for training inputs/targets."""
+        return self._extract_states(self.data.isel(time=time_idx))
+
+    def __getitem__(self, item):
+        ds_conditionals = self.data.isel(time=[item, item + self.time_step])
+        ds_state = self.data.isel(time=[item + 2 * self.time_step])
+
+        # Load inputs data
+        raw_states = self._extract_states(ds_conditionals)
+        raw_inputs = raw_states
 
         if self.static_features:
             ds_conditionals_static = (
@@ -261,26 +272,10 @@ class ERA5Dataset(Dataset):
         prev_inputs = np.nan_to_num(inputs).astype(np.float32)
 
         # Load target data
-        ds_state_atm = (
-            ds_state[self.atmospheric_features]
-            .to_array()
-            .transpose("longitude", "latitude", "isobaricInhPa", "variable")
-            .values
-        )
-        ds_state_atm = einops.rearrange(ds_state_atm, "lon lat lev var -> (var lev) lon lat")
-        raw_state = ds_state_atm
-        if self.single_features:
-            ds_state_single = (
-                ds_state[self.single_features]
-                .to_array()
-                .transpose("longitude", "latitude", "variable")
-                .values
-            )
-            ds_state_single = einops.rearrange(ds_state_single, "lon lat var -> (var) lon lat")
-            raw_state = np.concatenate([raw_state, ds_state_single], axis=0)
+        raw_state = self._extract_states(ds_state)[0]
 
         # Normalize target residuals
-        raw_state_change = raw_state - raw_inputs[1]
+        raw_state_change = raw_state - raw_states[1]
         if self.normalization_on:
             state_change = self._normalize(raw_state_change, self.diff_means, self.diff_stds)
         else:
@@ -314,103 +309,6 @@ def increment_clock_features(clock_features: torch.Tensor, step_size: int) -> to
         [sin_day_of_year, cos_day_of_year, sin_local_mean_time, cos_local_mean_time], dim=1
     )
     return updated_clock_features
-
-@DatasetRegistry.register("era5_test")
-class ERA5DatasetTest(ERA5Dataset):
-    """
-    Dataset class for ERA5 test data.
-    The get item returns multiple forecast steps in the future for comparison.
-    """
-
-    def __init__(
-        self,
-        cfg: DictConfig,
-    ):
-
-        super().__init__(cfg)
-        self.forecast_steps = cfg.get("forecast_steps", 5)
-
-    def __len__(self):
-        return sum(self.data["time.year"].values <= self.max_year) - 2 * self.time_step - (self.forecast_steps - 1) * self.time_step
-
-    def __getitem__(self, item):
-        ds_conditionals = self.data.isel(time=[item, item + self.time_step])
-        ds_state = self.data.isel(time=list(range(item + 2 * self.time_step, item + 2 * self.time_step + self.forecast_steps * self.time_step, self.time_step)))
-
-        # Load inputs data
-        ds_conditionals_atm = (
-            ds_conditionals[self.atmospheric_features]
-            .to_array()
-            .transpose("time", "longitude", "latitude", "isobaricInhPa", "variable")
-            .values
-        )
-        ds_conditionals_atm = einops.rearrange(ds_conditionals_atm, "t lon lat lev var -> t  (var lev) lon lat")
-        raw_inputs = ds_conditionals_atm
-
-        if self.single_features:
-            ds_conditionals_single = (
-                ds_conditionals[self.single_features]
-                .to_array()
-                .transpose("time", "longitude", "latitude", "variable")
-                .values
-            )
-            ds_conditionals_single = einops.rearrange(ds_conditionals_single, "t lon lat var -> t var lon lat")
-            raw_inputs = np.concatenate([raw_inputs, ds_conditionals_single], axis=1)
-
-        if self.static_features:
-            ds_conditionals_static = (
-                ds_conditionals[self.static_features]
-                .to_array()
-                .transpose("longitude", "latitude", "variable")
-                .values
-            )
-            ds_conditionals_static = np.stack([ds_conditionals_static] * 2, axis=0)
-            ds_conditionals_static = einops.rearrange(ds_conditionals_static, "t lon lat var -> t (var) lon lat")
-            raw_inputs = np.concatenate([raw_inputs, ds_conditionals_static], axis=1)
-
-
-        # Normalize inputs
-        if self.normalization_on:
-            inputs_norm = self._normalize(raw_inputs, self.means, self.stds)
-        else:
-            inputs_norm = raw_inputs
-
-        # Add time features
-        clock_features = self._generate_clock_features(ds_conditionals)
-        inputs = np.concatenate([inputs_norm, clock_features], axis=1)
-
-        # Concatenate timesteps
-        inputs = np.concatenate([inputs[0, :, :, :], inputs[1, :, :, :]], axis=0)
-        prev_inputs = np.nan_to_num(inputs).astype(np.float32)
-
-        # Load target data
-        ds_state_atm = (
-            ds_state[self.atmospheric_features]
-            .to_array()
-            .transpose("time","longitude", "latitude", "isobaricInhPa", "variable")
-            .values
-        )
-        ds_state_atm = einops.rearrange(ds_state_atm, "t lon lat lev var -> t (var lev) lon lat")
-        raw_state = ds_state_atm
-        if self.single_features:
-            ds_state_single = (
-                ds_state[self.single_features]
-                .to_array()
-                .transpose("time","longitude", "latitude", "variable")
-                .values
-            )
-            ds_state_single = einops.rearrange(ds_state_single, "t lon lat var -> t (var) lon lat")
-            raw_state = np.concatenate([raw_state, ds_state_single], axis=1)
-
-        # Normalize target state changes
-        raw_state_change = raw_state - np.copy(np.concatenate([raw_inputs[None,1, :, :, :], raw_state[:-1,:,:,:]], axis=0))
-        if self.normalization_on:
-            state_change = self._normalize(raw_state_change, self.diff_means, self.diff_stds)
-        else:
-            state_change = raw_state_change
-        state_change = np.nan_to_num(state_change).astype(np.float32)
-
-        return (prev_inputs, state_change, raw_state )
 
 @DatasetRegistry.register("era5_precomputed")
 class PrecomputedERA5Dataset(Dataset):
@@ -486,6 +384,140 @@ class PrecomputedERA5Dataset(Dataset):
             torch.from_numpy(self.inputs[actual_idx].copy()),
             torch.from_numpy(self.targets[actual_idx].copy()),
         )
+
+
+def select_init_indices(
+    times: np.ndarray,
+    segment_id: np.ndarray,
+    horizon: int,
+    stride: int = 36,
+    first_hour: int = 0,
+    explicit_times=None,
+    time_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Indices t into an hourly trajectory that are valid rollout inits: the
+    conditioning hour t-1 and every target hour up to t+horizon lie in the
+    same contiguous segment as t.
+
+    By default, inits start at the first valid `first_hour` UTC of each
+    segment and are spaced `stride` hours apart (a stride that is not a
+    multiple of 24 cycles through start hours). `explicit_times` (iterable of
+    datetime-likes) replaces the stride selection, e.g. for extreme events;
+    `time_mask` (bool per trajectory hour) further filters the result.
+    """
+    times = np.asarray(times).astype("datetime64[h]")
+    segment_id = np.asarray(segment_id)
+    T = len(times)
+    t = np.arange(1, max(T - horizon, 1))
+    valid = (segment_id[t - 1] == segment_id[t]) & (segment_id[t + horizon] == segment_id[t])
+    valid_idx = t[valid]
+
+    if explicit_times is not None:
+        wanted = np.asarray([np.datetime64(x, "h") for x in explicit_times])
+        pos = {tm: i for i, tm in enumerate(times)}
+        missing = [str(w) for w in wanted if w not in pos]
+        if missing:
+            raise ValueError(f"init times not in trajectory: {missing}")
+        idx = np.array([pos[w] for w in wanted], dtype=int)
+        valid_set = set(valid_idx.tolist())
+        invalid = [str(times[i]) for i in idx if i not in valid_set]
+        if invalid:
+            raise ValueError(f"init times without a full {horizon} h window in their segment: {invalid}")
+        selected = np.unique(idx)
+    else:
+        hours = (times - times.astype("datetime64[D]")).astype(int)
+        selected = []
+        for seg in np.unique(segment_id[valid_idx]):
+            seg_idx = valid_idx[segment_id[valid_idx] == seg]
+            starts = seg_idx[hours[seg_idx] == first_hour]
+            if len(starts) == 0:
+                continue
+            offset = (times[seg_idx] - times[starts[0]]).astype(int)
+            selected.extend(seg_idx[(offset >= 0) & (offset % stride == 0)])
+        selected = np.asarray(selected, dtype=int)
+
+    if time_mask is not None:
+        selected = selected[np.asarray(time_mask)[selected]]
+    return selected
+
+
+@DatasetRegistry.register("era5_trajectory")
+class TrajectoryDataset(Dataset):
+    """Autoregressive-rollout test set over an hourly state trajectory written
+    by precompute_trajectory.py (raw states + clock features + segment ids).
+
+    Each item is one rollout init t: the normalised conditioning
+    [state_{t-1}, clock_{t-1}, state_t, clock_t] (identical layout to the
+    training inputs) plus the raw true states and clock features for leads
+    1..horizon.
+
+    cfg keys: path, horizon, init_stride, init_first_hour, init_times (optional
+    explicit list overriding the stride selection).
+    """
+
+    def __init__(self, cfg: DictConfig) -> None:
+        super().__init__()
+        out_dir = Path(cfg.path)
+        with open(out_dir / "metadata.json") as f:
+            meta = json.load(f)
+
+        self.states = np.load(out_dir / "states.npy", mmap_mode="r")
+        self.clock = np.load(out_dir / "clock.npy", mmap_mode="r")
+        self.times = np.load(out_dir / "times.npy").astype("datetime64[h]")
+        self.segment_id = np.load(out_dir / "segment_id.npy")
+
+        self.pressure_levels = np.array(meta["pressure_levels"], dtype=np.float32)
+        self.atmospheric_features = list(meta["atmospheric_features"])
+        self.grid_lon = np.array(meta["grid_lon"], dtype=np.float32)
+        self.grid_lat = np.array(meta["grid_lat"], dtype=np.float32)
+        self.means = np.array(meta["means"], dtype=np.float32)
+        self.stds = np.array(meta["stds"], dtype=np.float32)
+        self.diff_means = np.array(meta["diff_means"], dtype=np.float32)
+        self.diff_stds = np.array(meta["diff_stds"], dtype=np.float32)
+
+        self.horizon = int(cfg.get("horizon", 12))
+        self.init_indices = select_init_indices(
+            self.times,
+            self.segment_id,
+            horizon=self.horizon,
+            stride=int(cfg.get("init_stride", 36)),
+            first_hour=int(cfg.get("init_first_hour", 0)),
+            explicit_times=cfg.get("init_times", None),
+        )
+        print(f"TrajectoryDataset: {len(self.init_indices)} inits, horizon {self.horizon} h, "
+              f"{len(np.unique(self.segment_id))} segments")
+
+    def _normalize(self, data, means, stds):
+        return (data - means[:, None, None]) / stds[:, None, None]
+
+    def _unnormalize(self, data, means, stds):
+        return data * stds[:, None, None] + means[:, None, None]
+
+    def init_time(self, idx) -> str:
+        return str(self.times[self.init_indices[idx]])
+
+    def conditioning_at(self, t: int) -> np.ndarray:
+        """Normalised (2*(C+4), lon, lat) conditioning for predicting t+1."""
+        blocks = []
+        for i in (t - 1, t):
+            state = self._normalize(np.asarray(self.states[i]), self.means, self.stds)
+            blocks.extend([state, np.asarray(self.clock[i])])
+        return np.nan_to_num(np.concatenate(blocks, axis=0)).astype(np.float32)
+
+    def __len__(self) -> int:
+        return len(self.init_indices)
+
+    def __getitem__(self, idx):
+        t = int(self.init_indices[idx])
+        H = self.horizon
+        return {
+            "cond": torch.from_numpy(self.conditioning_at(t)),
+            "init_state": torch.from_numpy(np.array(self.states[t], dtype=np.float32)),
+            "target_states": torch.from_numpy(np.array(self.states[t + 1:t + H + 1], dtype=np.float32)),
+            "target_clock": torch.from_numpy(np.array(self.clock[t + 1:t + H + 1], dtype=np.float32)),
+            "init_time": self.init_time(idx),
+            "index": idx,
+        }
 
 
 if __name__ == "__main__":

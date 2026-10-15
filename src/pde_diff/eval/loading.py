@@ -80,16 +80,10 @@ def load_model(cfg: DictConfig, model_path: str, device: str | None = None) -> D
     return model
 
 
-def build_test_dataloader(cfg: DictConfig, batch_size: int = 1, dataset_name: str | None = None) -> tuple[torch.utils.data.Dataset, DataLoader]:
-    """Instantiate the (OOD/test) evaluation dataset and its DataLoader.
-
-    `dataset_name`, if given, overrides `cfg.dataset.name` (e.g. to switch to
-    the multi-step-ahead `"era5_test"` dataset for rollout evaluation).
-    """
-    dataset_cfg = cfg.dataset
-    if dataset_name is not None:
-        dataset_cfg = OmegaConf.merge(dataset_cfg, {"name": dataset_name})
-    dataset = DatasetRegistry.create(dataset_cfg)
+def build_test_dataloader(cfg: DictConfig, batch_size: int = 1) -> tuple[torch.utils.data.Dataset, DataLoader]:
+    """Instantiate the single-step (OOD/test) evaluation dataset from the
+    model's own dataset config, and its DataLoader."""
+    dataset = DatasetRegistry.create(cfg.dataset)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,

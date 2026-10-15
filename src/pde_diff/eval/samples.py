@@ -4,13 +4,10 @@ histograms."""
 import os
 from pathlib import Path
 
-import einops as ein
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from pde_diff.eval_primitives import EXTENT_SUBSET, COLOR_BARS, VAR_UNITS, PLOT_TYPE
 
@@ -36,6 +33,7 @@ VAR_FULL_NAMES = {
 RES_NAMES = {
     "plan": ("Planetary Vorticity", 1, r"$s^{-2}$"),
     "gw": ("Geostrophic Wind", 2, r"$m \cdot s^{-1}$"),
+    "vd": ("Vorticity Divergence", 3, r"$s^{-2}$"),
 }
 
 
@@ -424,7 +422,7 @@ def plot_mse_of_all_vars(mse_maps, out_dir, vars):
         ax = fig.add_subplot(gs[i, 0])
 
         im = ax.imshow(mse_maps[i].T, extent=EXTENT_SUBSET, origin="lower", cmap="viridis")
-        ax.set_title(rf"Test MSE of $\small{{{{{var_symbol}}} , ||\Delta \tilde{{{var_symbol}}}_0 - \Delta {{{var_symbol}}}_0||^2}}$")
+        ax.set_title(rf"Test MSE of ${var_symbol}$, $||\Delta \tilde{{{var_symbol}}}_0 - \Delta {{{var_symbol}}}_0||^2$", fontsize="small")
         ax.set_yticklabels([])
         ax.set_yticks([])
         if i < len(vars) - 1:
@@ -443,65 +441,3 @@ def plot_mse_of_all_vars(mse_maps, out_dir, vars):
     plt.savefig(out_path, bbox_inches="tight", dpi=200)
     plt.close()
     print(f"Saved MSE map for all variables to {out_path}")
-
-
-def generate_prediction_error_distributions(
-    model,
-    dataset_test,
-    var_names: list[str] | None = None,
-    max_hist_samples_per_step: int = 8,
-    out_dir=Path("reports/eval/forecast_error_distributions"),
-):
-    """Collect single-step forecast-change vs target-change error samples
-    across the test dataset and save one PNG per variable."""
-    if var_names is None:
-        var_names = ["u", "v", "pv", "t", "z"]
-
-    dataloader_test = DataLoader(dataset_test, batch_size=1, shuffle=False, num_workers=4, persistent_workers=True)
-
-    collectors_f = {v: [[] for _ in range(3)] for v in var_names}
-    collectors_t = {v: [[] for _ in range(3)] for v in var_names}
-
-    for state in tqdm(dataloader_test, desc="Collecting forecast error samples"):
-        conditionals, targets, _ = state
-        conditionals = conditionals.to(model.device)
-        targets = targets[0].to(model.device)
-
-        pred_changes = model.sample_loop(batch_size=1, conditionals=conditionals[None, 0])
-
-        targets_rearranged = ein.rearrange(targets, "b (lev var) lon lat -> b lev var lon lat", lev=3)
-        pred_changes_rearranged = ein.rearrange(pred_changes, "b (lev var) lon lat -> b lev var lon lat", lev=3)
-
-        for j, var in enumerate(var_names):
-            if all(len(collectors_f[var][lvl]) >= max_hist_samples_per_step for lvl in range(3)):
-                continue
-
-            f_arr = pred_changes_rearranged[0, :, j, :, :].detach().cpu()
-            t_arr = targets_rearranged[0, :, j, :, :].detach().cpu()
-
-            for lvl in range(3):
-                mask = np.isfinite(f_arr[lvl].numpy().ravel()) & np.isfinite(t_arr[lvl].numpy().ravel())
-                if mask.sum() == 0:
-                    continue
-                collectors_f[var][lvl].append(f_arr[lvl].numpy().ravel()[mask])
-                collectors_t[var][lvl].append(t_arr[lvl].numpy().ravel()[mask])
-
-        all_full = all(len(collectors_f[v][lvl]) >= max_hist_samples_per_step for v in var_names for lvl in range(3))
-        if all_full:
-            break
-
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    for var in var_names:
-        if len(collectors_f[var]) == 0:
-            preds = [np.array([])]
-            targs = [np.array([])]
-        else:
-            preds = [np.concatenate(collectors_f[var][lvl]) for lvl in range(3)]
-            targs = [np.concatenate(collectors_t[var][lvl]) for lvl in range(3)]
-
-        try:
-            plot_forecast_error_distributions(preds, targs, variable=var, dir=out_dir)
-        except Exception as e:
-            print(f"Failed to plot forecast error distributions for var {var}: {e}")

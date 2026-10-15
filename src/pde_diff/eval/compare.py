@@ -1,61 +1,69 @@
-"""Multi-model comparison: overlay forecast-vs-step curves and train/val loss
+"""Multi-model comparison: overlay rollout-metric-vs-lead curves and train/val loss
 curves across an arbitrary list of models, using a generated color palette
 (no hardcoded model names/colors)."""
-import glob
 from pathlib import Path
 from typing import Callable, Optional
 
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from omegaconf import DictConfig
 
 from pde_diff.eval.loading import find_best_fold
 from pde_diff.eval.palette import get_model_color
-from pde_diff.eval.curves import _read_metrics
+from pde_diff.eval.curves import _read_metrics, lead_curve, MEMBER_STYLES
+from pde_diff.eval.rollout import RESIDUALS, load_rollout_metrics
 
 
-def load_loss_from_csv(csv_path):
-    df = pd.read_csv(csv_path, index_col=0)
-
-    cols = list(df.columns)
-    try:
-        x = sorted([int(c) for c in cols])
-        cols_sorted = [str(c) for c in x]
-    except Exception:
-        cols_sorted = cols
-
-    mean = df[cols_sorted].astype(float).mean(axis=0)
-    std = df[cols_sorted].astype(float).std(axis=0)
-    confidence = 1.96 * std / np.sqrt(len(df))
-    return cols_sorted, mean, confidence
+# (metric, member, reference member drawn once in black) overlaid across models.
+ROLLOUT_COMPARISONS = [
+    ("mse", "member_mean", "persistence"),
+    ("mse", "ens_mean", "persistence"),
+    ("crps", "ens", None),
+    ("spread", "ens", None),
+    *[(name, "member_mean", "truth") for name, _, _ in RESIDUALS],
+]
 
 
-def plot_forecast_step_curves(csv_by_model: dict[str, Path], loss_name: str, out_dir: Path) -> Path:
-    """Overlay mean+95%CI forecast-loss-vs-step curves for an arbitrary
-    number of models."""
+def plot_rollout_comparison(dfs_by_model: dict[str, pd.DataFrame], metric: str, member: str, out_dir: Path,
+                            reference_member: str | None = None, variable: str = "all", level: str = "all") -> Optional[Path]:
+    """Overlay mean+95%CI rollout-metric-vs-lead curves for an arbitrary
+    number of models, plus an optional model-independent reference curve
+    (ERA5 truth residuals, persistence) taken from the first model that has it."""
     fig, ax = plt.subplots(figsize=(5, 4))
-    model_ids = list(csv_by_model.keys())
-    n_models = len(model_ids)
+    n_models = len(dfs_by_model)
+    any_plotted = False
 
-    cols_sorted = None
-    for idx, model_id in enumerate(model_ids):
-        cols_sorted, mean, confidence = load_loss_from_csv(csv_by_model[model_id])
+    for idx, (label, df) in enumerate(dfs_by_model.items()):
+        curve = lead_curve(df, metric, member, variable, level)
+        if curve is None:
+            continue
+        x, mean, ci = curve
         color = get_model_color(idx, n_models)
-        ax.plot(range(1, len(cols_sorted) + 1), mean.values, 'o-', label=model_id, color=color)
-        ax.fill_between(range(1, len(cols_sorted) + 1), (mean - confidence).values, (mean + confidence).values, alpha=0.3, color=color)
+        ax.plot(x, mean, "o-", label=label, color=color)
+        ax.fill_between(x, mean - ci, mean + ci, alpha=0.3, color=color)
+        any_plotted = True
 
-    ax.set_xlabel("Forecast horizon (steps)")
-    ax.set_ylabel(loss_name)
-    ax.set_title(f"{loss_name} vs forecast step")
-    if cols_sorted is not None:
-        ax.set_xticks(range(1, len(cols_sorted) + 1))
+    if reference_member is not None:
+        for df in dfs_by_model.values():
+            curve = lead_curve(df, metric, reference_member, variable, level)
+            if curve is not None:
+                x, mean, _ = curve
+                ax.plot(x, mean, "--", color="black", label=MEMBER_STYLES[reference_member]["label"])
+                break
+
+    if not any_plotted:
+        plt.close(fig)
+        return None
+
+    ax.set_xlabel("Lead time (h)")
+    ax.set_ylabel(f"{metric} ({member})")
+    ax.set_title(f"{metric} vs lead time")
     ax.legend()
     fig.tight_layout()
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"compare_forecast_loss_vs_steps_{loss_name}.png"
+    out_path = out_dir / f"compare_rollout_{metric}_{member}.png"
     fig.savefig(out_path)
     plt.close(fig)
     print(f"Saved comparison plot to {out_path}")
@@ -102,18 +110,14 @@ def plot_loss_curve_comparison(model_ids: list[str], out_dir: Path, log_path: st
     return out_path
 
 
-def _find_forecast_csvs(eval_dir: Path) -> list[Path]:
-    return [Path(p) for p in glob.glob(str(Path(eval_dir) / "forecasting_losses_*.csv"))]
-
-
 def run_comparison(cfg: DictConfig, run_single_fn: Callable[[DictConfig, str], Path]) -> None:
-    """Compare `cfg.eval.compare.model_ids` on forecast-vs-step curves and
-    train/val loss curves.
+    """Compare `cfg.eval.compare.model_ids` on rollout-metric-vs-lead curves
+    and train/val loss curves.
 
     `run_single_fn(cfg, model_id) -> eval_output_dir` is injected (rather
     than imported) to avoid a circular import with eval.run, and is only
     invoked (in-process, no subprocess) when `cfg.eval.compare.rerun_missing`
-    is true and a model's forecasting CSVs don't exist yet.
+    is true and a model's rollout metrics don't exist yet.
     """
     model_ids = list(cfg.eval.compare.model_ids)
     labels = dict(cfg.eval.compare.get("labels", {}))
@@ -121,7 +125,7 @@ def run_comparison(cfg: DictConfig, run_single_fn: Callable[[DictConfig, str], P
     out_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_model_ids = []
-    csvs_by_model_and_loss: dict[str, dict[str, Path]] = {}
+    dfs_by_model: dict[str, pd.DataFrame] = {}
 
     for model_id in model_ids:
         best_fold_id, _ = find_best_fold(f"models/{model_id}")
@@ -129,20 +133,19 @@ def run_comparison(cfg: DictConfig, run_single_fn: Callable[[DictConfig, str], P
         resolved_model_ids.append(best_fold_id)
 
         eval_dir = Path(cfg.eval.output_dir) / f"{best_fold_id}_eval"
-        csvs = _find_forecast_csvs(eval_dir)
-        if not csvs and cfg.eval.compare.get("rerun_missing", True):
-            print(f"No forecasting-loss CSVs found for {model_id}; running single-model eval first.")
+        df = load_rollout_metrics(eval_dir)
+        if df is None and cfg.eval.compare.get("rerun_missing", True):
+            print(f"No rollout metrics found for {model_id}; running single-model eval first.")
             eval_dir = run_single_fn(cfg, model_id)
-            csvs = _find_forecast_csvs(eval_dir)
-
-        for csv_path in csvs:
-            loss_name = csv_path.stem.replace("forecasting_losses_", "")
-            csvs_by_model_and_loss.setdefault(loss_name, {})[display_name] = csv_path
-
-    for loss_name, csv_by_model in csvs_by_model_and_loss.items():
-        if len(csv_by_model) < 1:
+            df = load_rollout_metrics(eval_dir)
+        if df is None:
+            print(f"No rollout metrics for {model_id} in {eval_dir}; leaving it out of the rollout comparison.")
             continue
-        plot_forecast_step_curves(csv_by_model, loss_name, out_dir)
+        dfs_by_model[display_name] = df
+
+    if dfs_by_model:
+        for metric, member, reference in ROLLOUT_COMPARISONS:
+            plot_rollout_comparison(dfs_by_model, metric, member, out_dir, reference_member=reference)
 
     plot_loss_curve_comparison(resolved_model_ids, out_dir, metric="train_loss")
     plot_loss_curve_comparison(resolved_model_ids, out_dir, metric="val_loss")

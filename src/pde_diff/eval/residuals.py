@@ -1,9 +1,9 @@
 """Helpers for working with the (optional) physics-residual terms in
 VorticityLoss: reading their configured weights and wiring up the loss
-module's normalization stats against a given dataset."""
-from omegaconf import DictConfig, ListConfig
+evaluator's normalization stats against a given dataset."""
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
-from pde_diff.model import DiffusionModel
+from pde_diff.loss import VorticityLoss
 
 
 def get_residual_weights(model_cfg: DictConfig) -> list[float]:
@@ -19,11 +19,11 @@ def get_residual_weights(model_cfg: DictConfig) -> list[float]:
     return [c_residual] * n_residuals
 
 
-def build_residual_loss_fn(model: DiffusionModel, dataset):
-    """Wire up `model.loss_fn`'s normalization stats against `dataset`, if
-    not already set, and return it (so residual computation matches how
-    it's normalized during training/validation)."""
-    loss_fn = model.loss_fn
-    if not hasattr(loss_fn, "std") and hasattr(dataset, "means"):
-        loss_fn.set_mean_and_std(dataset.means, dataset.stds, dataset.diff_means, dataset.diff_stds)
+def build_residual_evaluator(dataset, device) -> VorticityLoss:
+    """Standalone VorticityLoss for computing the R1/R2/R3 physics residuals
+    on any model's forecasts, independent of the loss the model was trained
+    with (so MSE-only and physics-informed models are evaluated identically).
+    Normalization stats come from `dataset`."""
+    loss_fn = VorticityLoss(OmegaConf.create({"name": "vorticity", "c_residual": 0.0, "device": str(device)}))
+    loss_fn.set_mean_and_std(dataset.means, dataset.stds, dataset.diff_means, dataset.diff_stds)
     return loss_fn

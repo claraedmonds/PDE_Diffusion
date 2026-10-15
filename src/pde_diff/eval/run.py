@@ -8,17 +8,17 @@ from pathlib import Path
 
 import hydra
 import numpy as np
-import pandas as pd
 import torch
 import lightning as pl
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 import pde_diff.loss  # registers loss classes
 
+from pde_diff.utils import DatasetRegistry
 from pde_diff.eval.loading import find_best_fold, load_model_config, load_model, build_test_dataloader, get_grid_lat
-from pde_diff.eval.curves import plot_loss_curves, plot_residual_curves, plot_forecast_loss_vs_steps
-from pde_diff.eval.rollout import evaluate_forecasting
-from pde_diff.eval.samples import plot_sample_target_absdiff_stacked, generate_prediction_error_distributions
+from pde_diff.eval.curves import plot_loss_curves, plot_residual_curves, plot_rollout_summary, summarize_rollout
+from pde_diff.eval.rollout import evaluate_rollout
+from pde_diff.eval.samples import plot_sample_target_absdiff_stacked
 from pde_diff.eval.psd import plot_all_psd_variables
 from pde_diff.eval import compare as compare_module
 
@@ -37,8 +37,6 @@ def _resolve_eval_dataset(cfg: DictConfig) -> tuple[dict, str]:
     """
     dataset_type = cfg.eval.dataset.type
     name_suffix = "_eval" if dataset_type == "test" else f"_eval_{dataset_type}"
-    if cfg.eval.steps != 5:
-        name_suffix += f"_{cfg.eval.steps}steps"
 
     min_year = cfg.eval.dataset.get("min_year", None)
     max_year = cfg.eval.dataset.get("max_year", None)
@@ -74,7 +72,6 @@ def run_single(cfg: DictConfig, model_id: str | None = None) -> Path:
     with open_dict(model_cfg):
         for key, val in dataset_overrides.items():
             model_cfg.dataset[key] = val
-        model_cfg.dataset.forecast_steps = cfg.eval.steps
 
     name = f"{model_cfg.experiment.name}-{model_cfg.id}{name_suffix}"
     eval_dir = Path(cfg.eval.output_dir) / name
@@ -148,47 +145,46 @@ def run_single(cfg: DictConfig, model_id: str | None = None) -> Path:
             )
             print(f"  Saved {psd_path}")
 
-    # --- Autoregressive rollout ---------------------------------------------
-    # TODO: "era5_test" (ERA5DatasetTest in data/datasets.py) is a subclass
-    # of the zarr-backed ERA5Dataset only — there is no multi-step-ahead
-    # equivalent for PrecomputedERA5Dataset. Rollout will fail for
-    # era5_precomputed models (our current default) until a
-    # PrecomputedERA5DatasetTest class is written that returns
-    # forecast_steps-ahead targets from the same inputs.npy/targets.npy
-    # blob, mirroring how ERA5DatasetTest extends ERA5Dataset. Left as-is
-    # for now (set eval.plots.rollout=false to skip it in the meantime).
-
+    # --- Autoregressive ensemble rollout ------------------------------------
+    # Runs on the hourly test trajectory (precompute_trajectory.py), not on
+    # the model's single-step triplet dataset.
     if cfg.eval.plots.rollout:
-        print("Evaluating forecasting performance...")
-        dataset_test_multistep, _ = build_test_dataloader(model_cfg, dataset_name="era5_test")
-        forecasting_losses = evaluate_forecasting(
+        print("Evaluating autoregressive rollout ...")
+        rollout_cfg = cfg.eval.rollout
+        dataset_rollout = DatasetRegistry.create(OmegaConf.create({
+            "name": "era5_trajectory",
+            "path": rollout_cfg.data_path,
+            "horizon": rollout_cfg.horizon,
+            "init_stride": rollout_cfg.init_stride,
+            "init_first_hour": rollout_cfg.init_first_hour,
+            "init_times": rollout_cfg.get("init_times", None),
+        }))
+        for stat in ("means", "stds", "diff_means", "diff_stds"):
+            if not np.allclose(getattr(dataset_rollout, stat), getattr(dataset_test, stat)):
+                raise ValueError(f"Rollout trajectory '{stat}' differ from the model's training data; "
+                                 f"re-run precompute_trajectory.py with --stats-from <training metadata.json>.")
+
+        shard = tuple(rollout_cfg.shard) if rollout_cfg.get("shard", None) is not None else None
+        rollout_dir = eval_dir / "rollout"
+        df_rollout = evaluate_rollout(
             model,
-            dataset_test_multistep,
-            steps=cfg.eval.steps,
-            dir=eval_dir,
+            dataset_rollout,
+            out_dir=rollout_dir,
+            n_members=rollout_cfg.n_members,
+            metrics=list(rollout_cfg.metrics),
+            inits_per_batch=rollout_cfg.inits_per_batch,
+            shard=shard,
             n_qualitative_samples=cfg.eval.n_qualitative_samples,
             plot_sample_grids=cfg.eval.plots.sample_grids,
+            n_error_dist_inits=10 if cfg.eval.plots.error_distributions else 0,
+            num_workers=rollout_cfg.num_workers,
         )
-        for loss_name, loss_dict in forecasting_losses.items():
-            df = pd.DataFrame(loss_dict)
-            df.index = [f"Forecast{i+1}" for i in range(len(df))]
-            df.index.name = "forecast_step"
-            plot_forecast_loss_vs_steps(df, dir=eval_dir, loss_name=loss_name)
-            path_csv = eval_dir / f"forecasting_losses_{loss_name}.csv"
-            df.to_csv(path_csv)
-            print(f"Forecasting losses saved to CSV {path_csv}.")
-
-        for loss_name, loss_values in forecasting_losses.items():
-            for step, values in loss_values.items():
-                if len(values) == 0:
-                    continue
-                print(f"Step {step}: {loss_name} = {sum(values) / len(values)}")
-
-        if cfg.eval.plots.error_distributions:
-            print("Generating single-step forecast error distributions (step 1)...")
-            out_dir_dist = eval_dir / "forecast_error_distributions"
-            generate_prediction_error_distributions(model, dataset_test_multistep, max_hist_samples_per_step=10, out_dir=out_dir_dist)
-            print(f"Saved forecast error distributions to {out_dir_dist}")
+        if df_rollout is not None:
+            summary = summarize_rollout(df_rollout)
+            summary.to_csv(rollout_dir / "rollout_summary.csv", index=False)
+            plot_rollout_summary(df_rollout, rollout_dir / "curves", var_names=list(dataset_rollout.atmospheric_features))
+            overall = summary[(summary["variable"] == "all") & (summary["member"].isin(["member_mean", "truth", "ens"]))]
+            print(overall.pivot_table(index=["metric", "member"], columns="lead_h", values="mean").to_string())
 
     print(f"\nAll outputs saved to {eval_dir}/")
     return eval_dir

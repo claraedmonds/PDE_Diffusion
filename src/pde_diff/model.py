@@ -6,8 +6,6 @@ import lightning as pl
 from omegaconf import OmegaConf
 from pathlib import Path
 
-from pde_diff.data.datasets import increment_clock_features
-
 from pde_diff.utils import SchedulerRegistry, LossRegistry, ModelRegistry, init_means_and_stds_era5
 import pde_diff.scheduler
 import pde_diff.loss
@@ -215,27 +213,6 @@ class DiffusionModel(pl.LightningModule):
 
             samples = self.forward(model_in, t)
         return samples
-
-    def forecast(self, initial_condition, steps):
-        """Forecast multiple steps ahead given an initial condition tensor.
-        Returns the predicted changes at each forecast step."""
-        self.model.eval()
-        current_state = initial_condition.to(self.device)
-        forecasted_changes = []
-        for step in range(steps):
-            with torch.no_grad():
-                prediction = self.sample_loop(batch_size=current_state.size(0), conditionals=current_state)
-                next_state = current_state[:,-(self.data_dims.input_dims-self.data_dims.output_dims)//2:,:,:].clone().to(self.device)
-                next_state[:,:self.data_dims.output_dims, :, :] = self.loss_fn.get_original_states(x0_previous=next_state[:,:self.data_dims.output_dims], x0_change_pred=prediction, rearrange=False)[1]
-                next_state[:,:self.data_dims.output_dims] = self.loss_fn.get_normalized_states(x0=next_state[:,:self.data_dims.output_dims, :, :] )
-                # Update next_state with time information:
-                next_state[:, -4:, :, :] = increment_clock_features(
-                    next_state[:, -4:, :, :], step_size=self.cfg.dataset.time_step
-                ).to(self.device)
-                current_state = torch.cat([current_state[:,-(self.data_dims.input_dims-self.data_dims.output_dims)//2:,:,:], next_state], dim=1)
-            forecasted_changes.append(prediction)
-
-        return torch.stack(forecasted_changes, dim=1)
 
     def ddim_forward(self, samples, t, t_prev): #this assumes model predicts epsilon
         z = torch.randn_like(samples) if t_prev > 0 else 0

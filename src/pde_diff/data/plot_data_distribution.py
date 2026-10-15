@@ -84,6 +84,7 @@ if __name__ == "__main__":
         hist_data_noise = {
             "geostrophic_wind_noise": [],
             "planetary_vorticity_noise": [],
+            "vorticity_divergence_noise": [],
         }
         relative_wind_hist = {
             "geostrophic_wind_relative_error_u": [],
@@ -116,6 +117,7 @@ if __name__ == "__main__":
                 # use noisy prev/curr to inspect effect of noise
                 r_gw_noise = loss_fn.compute_residual_geostrophic_wind(prev_noise, curr_noise, normalize=False)
                 r_pv_noise = loss_fn.compute_residual_planetary_vorticity(prev_noise, curr_noise, normalize=False)
+                r_vd_noise = loss_fn.compute_residual_vorticity_divergence(prev_noise, curr_noise, normalize=False)
 
                 for key, r in (("geostrophic_wind", r_gw), ("planetary_vorticity", r_pv), ("vorticity_divergence", r_vd)):
                     s = residual_stats[key]
@@ -132,8 +134,9 @@ if __name__ == "__main__":
 
                 append_hist(r_gw_noise, hist_data_noise["geostrophic_wind_noise"], MAX_SAMPLES)
                 append_hist(r_pv_noise, hist_data_noise["planetary_vorticity_noise"], MAX_SAMPLES)
+                append_hist(r_vd_noise, hist_data_noise["vorticity_divergence_noise"], MAX_SAMPLES)
 
-                del prev, curr, r_gw, r_pv, r_vd, prev_noise, curr_noise, r_gw_noise, r_pv_noise
+                del prev, curr, r_gw, r_pv, r_vd, prev_noise, curr_noise, r_gw_noise, r_pv_noise, r_vd_noise
 
         results = {}
         for key, s in residual_stats.items():
@@ -144,12 +147,13 @@ if __name__ == "__main__":
         args.out_json.write_text(json.dumps(results, indent=2))
         print(f"Saved residual statistics to {args.out_json}")
 
-        # --- Plot 2 histograms side-by-side (counts, not normalized) ---
-        fig, axes = plt.subplots(1, 2, figsize=(8, 2.5), sharey=True)
+        # --- Plot 3 histograms side-by-side (counts, not normalized) ---
+        fig, axes = plt.subplots(1, 3, figsize=(12, 2.5), sharey=True)
 
         plots = [
             ("planetary_vorticity", r"$\mathcal{R}_1$ Planetary Vorticity Residual"),
             ("geostrophic_wind", r"$\mathcal{R}_2$ Geostrophic Wind Residual"),
+            ("vorticity_divergence", r"$\mathcal{R}_3$ Vorticity Divergence Residual"),
         ]
 
         for ax, (key, title) in zip(axes, plots):
@@ -270,12 +274,13 @@ if __name__ == "__main__":
         plt.savefig("reports/figures/era5_relative_geo_wind_residual_histograms.png", dpi=300)
         print("Saved histogram figure to reports/figures/era5_relative_geo_wind_residual_histograms.png")
 
-        # --- Plot 2 histograms side-by-side for noise (counts, not normalized) ---
-        fig, axes = plt.subplots(1, 2, figsize=(8, 2.5), sharey=True)
+        # --- Plot 3 histograms side-by-side for noise (counts, not normalized) ---
+        fig, axes = plt.subplots(1, 3, figsize=(12, 2.5), sharey=True)
 
         plots = [
             ("planetary_vorticity_noise", r"$\mathcal{R}_1$ Planetary Vorticity Residual on Noise"),
             ("geostrophic_wind_noise", r"$\mathcal{R}_2$ Geostrophic Wind Residual on Noise"),
+            ("vorticity_divergence_noise", r"$\mathcal{R}_3$ Vorticity Divergence Residual on Noise"),
         ]
 
         for ax, (key, title) in zip(axes, plots):

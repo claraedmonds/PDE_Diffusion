@@ -1,12 +1,53 @@
-model:
-  path: models/exp1-eval_test
+defaults:
+  - _self_
 
-steps: 5
+eval:
+  mode: single            # "single" | "compare"
 
-dataset:
-  type: test
-  path: ./data/era5/zarr_test
+  # --- single-model mode ---
+  model:
+    path: models/exp1-eval_test
+    fold_num: null         # explicit fold count for CV models; null = no fold-curve plot
 
+  # --- compare mode ---
+  compare:
+    model_ids: []           # e.g. [baseline, c1e2_pv] -> models/<id>
+    labels: {}               # optional {model_id: display_name} override
+    rerun_missing: true        # rerun single-model pipeline in-process if rollout metrics are missing
+
+  # --- single-step test set (trainer.test, sample grids, PSD) ---
+  dataset:
+    type: test               # test | ood (used only for output-dir naming)
+    # Held-out year range to slice out of the model's own precomputed
+    # inputs.npy/targets.npy blob (era5_precomputed only). Required.
+    min_year: null
+    max_year: null
+
+  # --- autoregressive rollout (hourly test trajectory, see precompute_trajectory.py) ---
+  rollout:
+    data_path: ./data/era5/test_trajectory
+    horizon: 12               # lead time in hours (1 h per step)
+    init_stride: 36           # hours between inits within a segment; 36 alternates 00/12 UTC starts
+    init_first_hour: 0        # UTC hour of the first init in each segment
+    init_times: null          # explicit init datetimes, overriding the stride (e.g. ["2023-01-15T00"])
+    n_members: 9              # ensemble members (independent diffusion samples) per init
+    inits_per_batch: 1        # inits rolled out together; batch size = inits_per_batch * n_members
+    metrics: [mse, residuals, spread, crps, persistence, rmse]
+    shard: null               # [i, n]: run every n-th init starting at i (for SLURM array jobs)
+    num_workers: 4
+
+  # --- plot-group enable/disable flags ---
+  plots:
+    loss_curves: true
+    residual_curves: true       # validation-only per-residual curves, scaled by c_residual
+    psd: true                    # single 5-subplot PSD comparison figure
+    rollout: true
+    error_distributions: true
+    sample_grids: true
+    save_forward_debug_samples: false
+  n_qualitative_samples: 1      # number of samples to plot residual/forecast grids for
+
+  output_dir: reports/eval       # unifies reports/inspect/ and reports/figures/evaluation/
 
 # Avoid logging to folders
 hydra:

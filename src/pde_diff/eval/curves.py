@@ -1,6 +1,7 @@
 """Loss-curve plotting for a single (possibly k-fold) training run:
-train/val loss per fold (combined into one plot), and validation-only
-per-residual curves scaled by that run's configured c_residual weights."""
+train/val loss per fold (combined into one plot), validation-only
+per-residual curves scaled by that run's configured c_residual weights, and
+rollout metrics vs lead time."""
 from pathlib import Path
 
 import numpy as np
@@ -8,8 +9,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from omegaconf import DictConfig
 
-from pde_diff.eval_primitives import PLOT_TYPE, plot_training_metrics, plot_cv_individual_fold_curves, find_metrics_csv
+from pde_diff.eval_primitives import PLOT_TYPE, VAR_UNITS, plot_training_metrics, plot_cv_individual_fold_curves, find_metrics_csv
 from pde_diff.eval.residuals import get_residual_weights
+from pde_diff.eval.rollout import RESIDUALS
 
 # metrics.csv column -> (residual short name, index into c_residual list)
 RESIDUAL_COLUMNS = [
@@ -120,32 +122,95 @@ def plot_residual_curves(
     print(f"Saved: {save_path}")
 
 
-def plot_forecast_loss_vs_steps(df, figsize=(8, 5), dir=None, loss_name=None):
-    """Reads a forecasting-losses CSV and plots mean loss vs forecast step
-    with a 95% CI band."""
-    cols = list(df.columns)
-    try:
-        x = sorted([int(c) for c in cols])
-        cols_sorted = [str(c) for c in x]
-    except Exception:
-        cols_sorted = cols
+# Display style per `member` value of the rollout metric rows.
+MEMBER_STYLES = {
+    "member_mean": dict(label="Forecast (member mean)", color="C0", ls="-", marker="o"),
+    "ens_mean": dict(label="Ensemble mean", color="C1", ls="-", marker="s"),
+    "ens": dict(label="Ensemble", color="C2", ls="-", marker="^"),
+    "persistence": dict(label="Persistence", color="gray", ls="--", marker=None),
+    "truth": dict(label="ERA5", color="black", ls="--", marker=None),
+}
 
-    fig, ax = plt.subplots(figsize=figsize)
-    mean = df[cols_sorted].astype(float).mean(axis=0)
-    std = df[cols_sorted].astype(float).std(axis=0)
-    confidence = 1.96 * std / np.sqrt(len(df))
-    ax.plot(range(1, len(cols_sorted) + 1), mean.values, marker='o', label='Mean')
-    ax.fill_between(range(1, len(cols_sorted) + 1), (mean - confidence).values, (mean + confidence).values, alpha=0.3, label='Mean 95% CI')
-    ax.set_xlabel('Forecast step')
-    ax.set_ylabel(f'{loss_name} Loss')
-    ax.set_title('Forecast loss vs forecast steps')
-    ax.set_xticks(range(1, len(cols_sorted) + 1))
+
+def lead_curve(df: pd.DataFrame, metric: str, member: str, variable: str = "all", level: str = "all"):
+    """Mean and 95% CI half-width over inits of one rollout metric vs lead
+    time, or None if no rows match."""
+    sub = df[(df["metric"] == metric) & (df["member"] == member)
+             & (df["variable"] == variable) & (df["level"] == level)]
+    if sub.empty:
+        return None
+    g = sub.groupby("lead_h")["value"]
+    mean = g.mean()
+    ci = (1.96 * g.std(ddof=1) / np.sqrt(g.count())).fillna(0.0)
+    return mean.index.values, mean.values, ci.values
+
+
+def plot_lead_curves(df: pd.DataFrame, curves: list[tuple[str, str]], out_path: Path, variable: str = "all",
+                     level: str = "all", ylabel: str | None = None, title: str | None = None) -> Path | None:
+    """Plot `(metric, member)` curves vs lead time (mean +- 95% CI over
+    inits) on one axis."""
+    fig, ax = plt.subplots(figsize=(6, 4))
+    any_plotted = False
+    for metric, member in curves:
+        curve = lead_curve(df, metric, member, variable, level)
+        if curve is None:
+            continue
+        x, mean, ci = curve
+        style = dict(MEMBER_STYLES.get(member, dict(label=member, color=None, ls="-", marker="o")))
+        label = style.pop("label")
+        if len({m for m, _ in curves}) > 1:
+            label = f"{metric}: {label}"
+        ax.plot(x, mean, label=label, **style)
+        ax.fill_between(x, mean - ci, mean + ci, alpha=0.25, color=ax.lines[-1].get_color())
+        any_plotted = True
+    if not any_plotted:
+        plt.close(fig)
+        return None
+
+    ax.set_xlabel("Lead time (h)")
+    ax.set_ylabel(ylabel or curves[0][0])
+    ax.set_title(title or f"{curves[0][0]} vs lead time ({variable}, {level})")
+    ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
-
-    dir = Path(dir) if dir is not None else Path(".")
-    dir.mkdir(parents=True, exist_ok=True)
-    save_path = dir / f'forecast_loss_vs_steps_{loss_name}.png'
-    fig.savefig(save_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f'Forecast loss vs steps plot saved to {save_path}.')
+    return out_path
+
+
+def summarize_rollout(df: pd.DataFrame) -> pd.DataFrame:
+    """Mean, 95% CI half-width and number of inits per
+    (metric, member, variable, level, lead_h)."""
+    g = df.groupby(["metric", "member", "variable", "level", "lead_h"])["value"]
+    out = g.agg(mean="mean", std="std", n="count").reset_index()
+    out["ci95"] = (1.96 * out["std"] / np.sqrt(out["n"])).fillna(0.0)
+    return out.drop(columns="std")
+
+
+def plot_rollout_summary(df: pd.DataFrame, out_dir: Path, var_names: list[str], level: str = "500") -> None:
+    """Standard set of rollout plots: MSE (overall and per variable at
+    `level`), R1-R3 residuals against the ERA5 reference, CRPS, spread vs
+    skill, and lat-weighted RMSE per variable."""
+    out_dir = Path(out_dir)
+    plots = [
+        (dict(curves=[("mse", "member_mean"), ("mse", "ens_mean"), ("mse", "persistence")],
+              ylabel="MSE (normalised)"), "mse_all"),
+        (dict(curves=[("crps", "ens")], ylabel="CRPS (normalised)"), "crps_all"),
+        (dict(curves=[("spread", "ens"), ("ens_mean_rmse", "ens_mean")], ylabel="Normalised units",
+              title="Ensemble spread vs ensemble-mean RMSE"), "spread_skill_all"),
+    ]
+    for name, _, _ in RESIDUALS:
+        plots.append((dict(curves=[(name, "member_mean"), (name, "truth")], ylabel=f"mean |{name.split('_')[0]}| (normalised)",
+                           title=name.replace("_", " ")), name))
+    for var in var_names:
+        plots.append((dict(curves=[("mse", "member_mean"), ("mse", "ens_mean"), ("mse", "persistence")],
+                           variable=var, level=level, ylabel="MSE (normalised)"), f"mse_{var}{level}"))
+        plots.append((dict(curves=[("rmse", "member_mean"), ("rmse", "ens_mean"), ("rmse", "persistence")],
+                           variable=var, level=level, ylabel=f"RMSE ({VAR_UNITS.get(var, '')})"), f"rmse_{var}{level}"))
+
+    for kwargs, name in plots:
+        path = plot_lead_curves(df, out_path=out_dir / f"{name}{PLOT_TYPE}", **kwargs)
+        if path is not None:
+            print(f"Saved: {path}")
