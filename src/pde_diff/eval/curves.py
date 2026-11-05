@@ -25,11 +25,12 @@ def plot_loss_curves(model_id: str, out_dir: Path, fold_num: int | None = None, 
     """Plot train/val loss vs epoch. When `fold_num` is set, each fold's
     curve is drawn as a separate line on one shared-axes plot (not one plot
     per fold) instead of the unfolded single-run plot — a k-fold model has
-    no `logs/<model_id>/` directory of its own, only `<model_id>-<fold>/`."""
+    no `logs/<model_id>/` directory of its own, only `<model_id>-<fold>/`.
+    Saved to `out_dir`/loss_curves/."""
     if fold_num:
-        plot_cv_individual_fold_curves(model_id, fold_num, log_path=log_path, out_dir=out_dir.parent)
+        plot_cv_individual_fold_curves(model_id, fold_num, log_path=log_path, out_dir=Path(out_dir) / "loss_curves")
     else:
-        plot_training_metrics(model_id, out_dir=out_dir.parent)
+        plot_training_metrics(model_id, out_dir=Path(out_dir) / "loss_curves")
 
 
 def _read_metrics(model_id: str, log_path: str = "logs") -> pd.DataFrame | None:
@@ -114,7 +115,7 @@ def plot_residual_curves(
     ax.legend(frameon=True, fancybox=True, framealpha=0.9)
     fig.tight_layout()
 
-    save_dir = Path(out_dir) / model_id
+    save_dir = Path(out_dir) / "loss_curves"
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / f"val_residual_curves{PLOT_TYPE}"
     fig.savefig(save_path, dpi=300, bbox_inches="tight")

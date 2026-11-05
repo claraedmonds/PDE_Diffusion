@@ -248,10 +248,11 @@ def find_metrics_csv(model_id: str, log_path: str = "logs") -> Path:
     return version_dirs[-1] / "metrics.csv"
 
 
-def plot_training_metrics(model_id, out_dir=Path("./reports/figures")):
+def plot_training_metrics(model_id, out_dir=None):
+    """Saves to `out_dir`, or to reports/figures/<model_id>/ when not given."""
     import pandas as pd
     df = pd.read_csv(find_metrics_csv(model_id)).sort_values(["epoch", "step"])
-    save_dir = Path(out_dir) / model_id
+    save_dir = Path(out_dir) if out_dir is not None else Path("./reports/figures") / model_id
     save_dir.mkdir(parents=True, exist_ok=True)
 
     metrics = [
@@ -297,19 +298,19 @@ def plot_cv_individual_fold_curves(
     model_id,
     fold_num,
     log_path="logs",
-    out_dir=Path("./reports/figures"),
+    out_dir=None,
     metrics=("train_loss", "val_loss"),
     smooth_window=1,
 ):
     """
     Plot each fold's loss curve as a separate line on one shared-axes plot
     (one figure per metric), for a cross-validated model
-    `{model_id}-1` .. `{model_id}-{fold_num}`.
+    `{model_id}-1` .. `{model_id}-{fold_num}`. Saves to `out_dir`, or to
+    reports/figures/<model_id>/ when not given.
     """
     import pandas as pd
 
-    out_dir = Path(out_dir)
-    save_dir = out_dir / model_id
+    save_dir = Path(out_dir) if out_dir is not None else Path("./reports/figures") / model_id
     save_dir.mkdir(parents=True, exist_ok=True)
 
     def smooth(arr, window):

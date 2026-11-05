@@ -1,26 +1,35 @@
 """
-Radial power-spectral-density (PSD) computation and plotting for comparing
-ERA5 ground truth vs. one or more trained models' forecasts, at 500 hPa.
+Radial power-spectral-density (PSD) of rollout forecasts vs. ERA5 truth at
+one pressure level, averaged over a fixed, evenly spaced subset of rollout
+inits and every ensemble member, at a few lead times.
 
-All variables are drawn onto a single figure (one subplot per variable)
-rather than one PNG per variable.
+`compute_rollout_psd` saves the mean spectra per model to `psd_rollout.npz`
+in its eval dir; `plot_psd_grid` draws one or more models' saved spectra on
+one figure (rows = leads, columns = variables), so compare mode can overlay
+models without re-running them.
 """
 from pathlib import Path
 
 import numpy as np
+import torch
 from scipy.fft import fft2, fftfreq
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
-from pde_diff.eval_primitives import PLOT_TYPE
 from pde_diff.eval.palette import get_model_color
+from pde_diff.eval.rollout import Normalizer, rollout_ensemble, QUALITATIVE_LEVEL_IDX
 
 EARTH_RADIUS_KM = 6371.0088
 DEG_TO_KM = np.pi / 180.0 * EARTH_RADIUS_KM  # ~111.32 km/deg
+PSD_FILE = "psd_rollout.npz"
+PSD_KINDS = {"change": "1 h change", "state": "state"}
 
 
-def radial_psd(field: np.ndarray, dx_km: float) -> tuple[np.ndarray, np.ndarray]:
+def radial_psd(fields: np.ndarray, dx_km: float) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute the azimuthally-averaged (radial) power spectral density of a 2-D field.
+    Azimuthally-averaged (radial) power spectral density of one or a batch
+    of 2-D fields, shaped (..., ny, nx).
 
     A Hann window is applied before the FFT. Without it, the field's sharp
     rectangular edges act as an implicit boxcar window, whose FFT leaks
@@ -28,53 +37,39 @@ def radial_psd(field: np.ndarray, dx_km: float) -> tuple[np.ndarray, np.ndarray]
     real high-wavenumber differences between fields (e.g. it can make a
     heavily-blurred field's PSD look nearly identical to the unblurred one).
 
-    Parameters
-    ----------
-    field  : 2-D array.
-    dx_km  : grid spacing [km] (isotropic — see compute_dx_km).
-
     Returns
     -------
     k_centres : np.ndarray — wavenumber bin centres [cycles / km]
-    psd       : np.ndarray — mean power in each bin
+    psd       : np.ndarray — mean power in each bin, shaped (..., n_bins)
     """
-    if np.isnan(field).any():
-        field = field.copy()
-        field[np.isnan(field)] = np.nanmean(field)
+    fields = np.asarray(fields, dtype=np.float64)
+    if np.isnan(fields).any():
+        fill = np.nanmean(fields, axis=(-2, -1), keepdims=True)
+        fields = np.where(np.isnan(fields), fill, fields)
 
-    ny, nx = field.shape
+    ny, nx = fields.shape[-2:]
 
     window = np.hanning(ny)[:, None] * np.hanning(nx)[None, :]
     window /= np.sqrt(np.mean(window ** 2))  # preserve overall power scale
 
-    f2d = fft2((field - field.mean()) * window)
+    f2d = fft2((fields - fields.mean(axis=(-2, -1), keepdims=True)) * window, axes=(-2, -1))
     power = (np.abs(f2d) ** 2) / (ny * nx)
 
-    ky = fftfreq(ny, d=dx_km)
-    kx = fftfreq(nx, d=dx_km)
-    KX, KY = np.meshgrid(kx, ky)
+    KX, KY = np.meshgrid(fftfreq(nx, d=dx_km), fftfreq(ny, d=dx_km))
     K = np.sqrt(KX ** 2 + KY ** 2)
 
-    k_max = 0.5 / dx_km
     n_bins = min(ny, nx) // 2
-    k_bins = np.linspace(0, k_max, n_bins + 1)
-    psd = np.zeros(n_bins)
-    counts = np.zeros(n_bins)
-    for i in range(n_bins):
-        mask = (K >= k_bins[i]) & (K < k_bins[i + 1])
-        if mask.any():
-            psd[i] = power[mask].mean()
-            counts[i] = mask.sum()
-    k_centres = 0.5 * (k_bins[:-1] + k_bins[1:])
+    k_bins = np.linspace(0, 0.5 / dx_km, n_bins + 1)
+    bin_idx = np.digitize(K, k_bins).ravel() - 1  # bin i holds k_bins[i] <= K < k_bins[i + 1]
+    in_range = bin_idx < n_bins
+    onehot = np.zeros((ny * nx, n_bins))
+    onehot[np.flatnonzero(in_range), bin_idx[in_range]] = 1.0
+    counts = onehot.sum(0)
     valid = counts > 0
-    return k_centres[valid], psd[valid]
 
-
-def radial_psd_wavelength(field: np.ndarray, dx_km: float) -> tuple[np.ndarray, np.ndarray]:
-    """Radially averaged 2-D PSD. Returns (wavelength_km, power), DC bin dropped."""
-    k, psd = radial_psd(field, dx_km)
-    k, psd = k[1:], psd[1:]
-    return 1.0 / k, psd
+    psd = power.reshape(*power.shape[:-2], ny * nx) @ (onehot[:, valid] / counts[valid])
+    k_centres = 0.5 * (k_bins[:-1] + k_bins[1:])
+    return k_centres[valid], psd
 
 
 def compute_dx_km(grid_lat: np.ndarray) -> float:
@@ -91,86 +86,123 @@ def compute_dx_km(grid_lat: np.ndarray) -> float:
     return grid_spacing_deg * DEG_TO_KM
 
 
-def compute_psd_curves(
-    ground_truth: np.ndarray,
-    predictions: dict[str, np.ndarray],
-    dx_km: float,
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """
-    ground_truth : (lon, lat) physical-unit field.
-    predictions  : {model_label: (lon, lat) field}, same shape as ground_truth.
+@torch.no_grad()
+def compute_rollout_psd(
+    model,
+    dataset,
+    out_path: Path,
+    n_inits: int = 50,
+    n_members: int = 9,
+    leads: list[int] = (1, 6, 12),
+    level_idx: int = QUALITATIVE_LEVEL_IDX,
+    inits_per_batch: int = 1,
+    num_workers: int = 4,
+) -> dict:
+    """Mean radial PSD of the raw predicted state and 1 h state change at
+    `level_idx`, over `n_inits` evenly spaced inits of `dataset` (a
+    TrajectoryDataset) x `n_members` members, at each lead in `leads`; the
+    ERA5 truth is averaged over the same inits. The init subset only depends
+    on `len(dataset)`, so every model is scored on the same inits.
 
-    Returns {"ground_truth": (wavelength_km, psd), model_label: (wavelength_km, psd), ...}
-    """
-    curves = {"ground_truth": radial_psd_wavelength(ground_truth, dx_km)}
-    for label, field in predictions.items():
-        curves[label] = radial_psd_wavelength(field, dx_km)
-    return curves
+    Saved to `out_path`; an existing file with the same settings is reused."""
+    leads = sorted(int(k) for k in leads if 1 <= k <= dataset.horizon)
+    settings = dict(n_inits=n_inits, n_members=n_members, leads=leads, level_idx=level_idx)
+    out_path = Path(out_path)
+    if out_path.exists():
+        saved = load_psd(out_path)
+        if all(np.array_equal(saved.get(key), val) for key, val in settings.items()):
+            print(f"Reusing PSD in {out_path}")
+            return saved
+
+    device = model.device
+    norm = Normalizer(dataset, device)
+    var_names = list(dataset.atmospheric_features)
+    n_levels = len(dataset.pressure_levels)
+    channels = [j * n_levels + level_idx for j in range(len(var_names))]
+    dx_km = compute_dx_km(dataset.grid_lat)
+    H = max(leads)
+    lead_idx = [k - 1 for k in leads]
+
+    indices = np.unique(np.linspace(0, len(dataset) - 1, min(n_inits, len(dataset))).round().astype(int))
+    loader = DataLoader(Subset(dataset, indices.tolist()), batch_size=inits_per_batch, shuffle=False,
+                        num_workers=num_workers)
+
+    sums = {f"{who}_{kind}": 0.0 for who in ("pred", "true") for kind in PSD_KINDS}
+    n_pred = n_true = 0
+    for batch in tqdm(loader, desc="PSD rollout"):
+        clock = batch["target_clock"][:, :H].to(device)
+        pred_states, pred_changes = rollout_ensemble(model, batch["cond"].to(device), clock, n_members, norm)
+        pred_changes = norm.unnorm_change(pred_changes)
+        true_states = batch["target_states"][:, :H].to(device)
+        true_prev = torch.cat([batch["init_state"][:, None].to(device), true_states[:, :-1]], dim=1)
+
+        fields = {
+            "pred_state": pred_states[:, :, lead_idx][..., channels, :, :].flatten(0, 1),  # (B*M, L, V, lon, lat)
+            "pred_change": pred_changes[:, :, lead_idx][..., channels, :, :].flatten(0, 1),
+            "true_state": true_states[:, lead_idx][..., channels, :, :],                    # (B, L, V, lon, lat)
+            "true_change": (true_states - true_prev)[:, lead_idx][..., channels, :, :],
+        }
+        for key, val in fields.items():
+            k_centres, psd = radial_psd(val.cpu().numpy(), dx_km)
+            sums[key] = sums[key] + psd.sum(0)
+        n_pred += pred_states.shape[0] * pred_states.shape[1]
+        n_true += true_states.shape[0]
+
+    result = {key: val / (n_pred if key.startswith("pred") else n_true) for key, val in sums.items()}
+    result.update(settings, wavelength_km=1.0 / k_centres[1:], var_names=np.array(var_names),
+                  level=str(int(dataset.pressure_levels[level_idx])),
+                  init_times=np.array([dataset.init_time(k) for k in indices]))
+    for key in sums:  # drop the DC bin, as for wavelength_km
+        result[key] = result[key][..., 1:]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out_path, **result)
+    print(f"Saved PSD ({len(indices)} inits x {n_members} members) to {out_path}")
+    return result
 
 
-def plot_psd_comparison_on_axis(
-    ax,
-    curves: dict[str, tuple[np.ndarray, np.ndarray]],
-    variable: str,
-    model_labels: list[str] | None = None,
-) -> None:
-    """Draw one variable's PSD comparison (ground truth + every model in
-    `curves`) onto a given Axes."""
-    wl_gt, psd_gt = curves["ground_truth"]
-    ax.loglog(wl_gt, psd_gt, color="black", lw=1.8, label="ERA5 (ground truth)")
-
-    if model_labels is None:
-        model_labels = [label for label in curves if label != "ground_truth"]
-    n_models = len(model_labels)
-
-    for model_idx, label in enumerate(model_labels):
-        wl, psd = curves[label]
-        color = get_model_color(model_idx, n_models)
-        ax.loglog(wl, psd, color=color, lw=1.5, label=label)
-
-    ax.set_xlabel("Wavelength (km)")
-    ax.set_ylabel("Power spectral density")
-    ax.set_title(f"{variable} (500 hPa)")
-    ax.invert_xaxis()  # large scales on the left, small scales (blurring) on the right
-    ax.grid(True, which="both", alpha=0.3)
+def load_psd(path: Path) -> dict:
+    with np.load(path) as saved:
+        return {key: saved[key] for key in saved.files}
 
 
-def plot_all_psd_variables(
-    ground_truth_state: np.ndarray,
-    predictions_by_model: dict[str, np.ndarray],
-    grid_lat: np.ndarray,
-    var_names: list[str],
-    out_dir: Path,
-) -> Path:
-    """
-    ground_truth_state   : (var, lon, lat) physical-unit field at 500 hPa.
-    predictions_by_model : {model_id: (var, lon, lat)}, same shape.
+def plot_psd_grid(psd_by_model: dict[str, dict], kind: str, out_path: Path) -> Path:
+    """One figure of mean PSDs (rows = leads, columns = variables) for one or
+    more models' `compute_rollout_psd` results, with ERA5 truth in black.
+    `kind` is "change" or "state". All models must share the same inits."""
+    labels = list(psd_by_model)
+    ref = psd_by_model[labels[0]]
+    for label in labels[1:]:
+        if not np.array_equal(psd_by_model[label]["init_times"], ref["init_times"]):
+            print(f"Warning: {label} PSD uses different inits than {labels[0]}; truth curve is from {labels[0]}.")
 
-    Computes dx_km once from grid_lat and produces one figure with a subplot
-    per variable (`len(var_names)` panels total), saved as a single PNG.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    leads, var_names = list(ref["leads"]), [str(v) for v in ref["var_names"]]
+    fig, axes = plt.subplots(len(leads), len(var_names), figsize=(4 * len(var_names), 3.3 * len(leads)),
+                             squeeze=False)
+    for i, lead in enumerate(leads):
+        for j, var in enumerate(var_names):
+            ax = axes[i, j]
+            ax.loglog(ref["wavelength_km"], ref[f"true_{kind}"][i, j], color="black", lw=1.8, label="ERA5")
+            for idx, label in enumerate(labels):
+                psd = psd_by_model[label]
+                ax.loglog(psd["wavelength_km"], psd[f"pred_{kind}"][i, j], color=get_model_color(idx, len(labels)),
+                          lw=1.5, label=label)
+            ax.invert_xaxis()  # large scales on the left, small scales (blurring) on the right
+            ax.grid(True, which="both", alpha=0.3)
+            ax.set_title(f"{var} ({ref['level']} hPa), lead {lead} h")
+            if i == len(leads) - 1:
+                ax.set_xlabel("Wavelength (km)")
+            if j == 0:
+                ax.set_ylabel("Power spectral density")
 
-    dx_km = compute_dx_km(grid_lat)
-    model_labels = list(predictions_by_model.keys())
+    handles, legend_labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, loc="lower center", ncol=min(len(legend_labels), 5), bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle(f"PSD of the {PSD_KINDS[kind]}: mean over {len(ref['init_times'])} inits x {int(ref['n_members'])} members")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
 
-    n_vars = len(var_names)
-    fig, axes = plt.subplots(1, n_vars, figsize=(5 * n_vars, 4.5))
-    if n_vars == 1:
-        axes = [axes]
-
-    for j, var in enumerate(var_names):
-        preds = {model_id: arr[j] for model_id, arr in predictions_by_model.items()}
-        curves = compute_psd_curves(ground_truth_state[j], preds, dx_km)
-        plot_psd_comparison_on_axis(axes[j], curves, var, model_labels=model_labels)
-
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 5), bbox_to_anchor=(0.5, -0.05))
-    fig.suptitle("Power spectral density")
-    fig.tight_layout()
-
-    path = out_dir / f"psd_all_variables{PLOT_TYPE}"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    return path
+    print(f"Saved PSD plot to {out_path}")
+    return out_path

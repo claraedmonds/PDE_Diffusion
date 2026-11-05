@@ -1,6 +1,7 @@
 """Multi-model comparison: overlay rollout-metric-vs-lead curves and train/val loss
 curves across an arbitrary list of models, using a generated color palette
 (no hardcoded model names/colors)."""
+from datetime import date
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -12,6 +13,8 @@ from pde_diff.eval.loading import find_best_fold
 from pde_diff.eval.palette import get_model_color
 from pde_diff.eval.curves import _read_metrics, lead_curve, MEMBER_STYLES
 from pde_diff.eval.rollout import RESIDUALS, load_rollout_metrics
+from pde_diff.eval.psd import PSD_FILE, PSD_KINDS, load_psd, plot_psd_grid
+from pde_diff.eval_primitives import PLOT_TYPE
 
 
 # (metric, member, reference member drawn once in black) overlaid across models.
@@ -121,31 +124,41 @@ def run_comparison(cfg: DictConfig, run_single_fn: Callable[[DictConfig, str], P
     """
     model_ids = list(cfg.eval.compare.model_ids)
     labels = dict(cfg.eval.compare.get("labels", {}))
-    out_dir = Path(cfg.eval.output_dir) / "compare"
+    out_dir = Path(cfg.eval.output_dir) / f"compare_{date.today().isoformat()}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_model_ids = []
     dfs_by_model: dict[str, pd.DataFrame] = {}
+    psd_by_model: dict[str, dict] = {}
 
     for model_id in model_ids:
         best_fold_id, _ = find_best_fold(f"models/{model_id}")
         display_name = labels.get(model_id, model_id)
         resolved_model_ids.append(best_fold_id)
 
-        eval_dir = Path(cfg.eval.output_dir) / f"{best_fold_id}_eval"
-        df = load_rollout_metrics(eval_dir)
+        rollout_dir = Path(cfg.eval.output_dir) / f"{best_fold_id}_eval" / "rollout"
+        df = load_rollout_metrics(rollout_dir)
         if df is None and cfg.eval.compare.get("rerun_missing", True):
             print(f"No rollout metrics found for {model_id}; running single-model eval first.")
-            eval_dir = run_single_fn(cfg, model_id)
-            df = load_rollout_metrics(eval_dir)
+            rollout_dir = run_single_fn(cfg, model_id) / "rollout"
+            df = load_rollout_metrics(rollout_dir)
+        psd_path = rollout_dir.parent / PSD_FILE
+        if psd_path.exists():
+            psd_by_model[display_name] = load_psd(psd_path)
+        else:
+            print(f"No PSD for {model_id} in {psd_path}; leaving it out of the PSD comparison "
+                  f"(run it with eval.model.path=models/{best_fold_id} eval.plots.rollout=false).")
         if df is None:
-            print(f"No rollout metrics for {model_id} in {eval_dir}; leaving it out of the rollout comparison.")
+            print(f"No rollout metrics for {model_id} in {rollout_dir}; leaving it out of the rollout comparison.")
             continue
         dfs_by_model[display_name] = df
 
     if dfs_by_model:
         for metric, member, reference in ROLLOUT_COMPARISONS:
             plot_rollout_comparison(dfs_by_model, metric, member, out_dir, reference_member=reference)
+    if psd_by_model:
+        for kind in PSD_KINDS:
+            plot_psd_grid(psd_by_model, kind, out_dir / f"compare_psd_{kind}{PLOT_TYPE}")
 
     plot_loss_curve_comparison(resolved_model_ids, out_dir, metric="train_loss")
     plot_loss_curve_comparison(resolved_model_ids, out_dir, metric="val_loss")

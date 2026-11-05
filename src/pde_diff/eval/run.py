@@ -15,11 +15,12 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 import pde_diff.loss  # registers loss classes
 
 from pde_diff.utils import DatasetRegistry
-from pde_diff.eval.loading import find_best_fold, load_model_config, load_model, build_test_dataloader, get_grid_lat
+from pde_diff.eval_primitives import PLOT_TYPE
+from pde_diff.eval.loading import find_best_fold, load_model_config, load_model, build_test_dataloader
 from pde_diff.eval.curves import plot_loss_curves, plot_residual_curves, plot_rollout_summary, summarize_rollout
 from pde_diff.eval.rollout import evaluate_rollout
 from pde_diff.eval.samples import plot_sample_target_absdiff_stacked
-from pde_diff.eval.psd import plot_all_psd_variables
+from pde_diff.eval.psd import PSD_FILE, PSD_KINDS, compute_rollout_psd, plot_psd_grid
 from pde_diff.eval import compare as compare_module
 
 VARS = ["u", "v", "pv", "t", "z"]
@@ -112,45 +113,23 @@ def run_single(cfg: DictConfig, model_id: str | None = None) -> Path:
             ch = j * 3 + level_idx
             plot_sample_target_absdiff_stacked(pred_changes[ch], target_changes[0, ch], variable=var, sample_idx=0, dir=dir_sample)
 
-    # --- Qualitative sample + PSD plots -------------------------------------
-    if cfg.eval.plots.sample_grids or cfg.eval.plots.psd:
+    # --- Qualitative sample ---------------------------------------------------
+    if cfg.eval.plots.sample_grids:
         cond, target = dataset_test[0]
         cond = cond.unsqueeze(0).to(model.device)
         target = target.to(model.device)
         with torch.no_grad():
             pred = model.sample_loop(batch_size=1, conditionals=cond)[0]
 
-        if cfg.eval.plots.sample_grids:
-            level_idx = 1  # 500 hPa
-            for j, var in enumerate(VARS):
-                ch = j * 3 + level_idx
-                plot_sample_target_absdiff_stacked(pred[ch], target[ch], variable=var, sample_idx=0, dir=eval_dir / "sample_0")
+        level_idx = 1  # 500 hPa
+        for j, var in enumerate(VARS):
+            ch = j * 3 + level_idx
+            plot_sample_target_absdiff_stacked(pred[ch], target[ch], variable=var, sample_idx=0, dir=eval_dir / "sample_0")
 
-        ## TODO: additionally, the PSD is only computed for 1 sample
-        if cfg.eval.plots.psd:
-            diff_means = torch.as_tensor(dataset_test.diff_means, device=model.device)
-            diff_stds = torch.as_tensor(dataset_test.diff_stds, device=model.device)
-            pred_un = (pred * diff_stds.view(-1, 1, 1) + diff_means.view(-1, 1, 1)).cpu().numpy()
-            target_un = (target * diff_stds.view(-1, 1, 1) + diff_means.view(-1, 1, 1)).cpu().numpy()
-            level_idx = 1
-            gt_500 = np.stack([target_un[j * 3 + level_idx] for j in range(len(VARS))])
-            pred_500 = np.stack([pred_un[j * 3 + level_idx] for j in range(len(VARS))])
-            grid_lat = get_grid_lat(dataset_test)
-            psd_path = plot_all_psd_variables(
-                ground_truth_state=gt_500,
-                predictions_by_model={base_id: pred_500},
-                grid_lat=grid_lat,
-                var_names=VARS,
-                out_dir=eval_dir,
-            )
-            print(f"  Saved {psd_path}")
-
-    # --- Autoregressive ensemble rollout ------------------------------------
-    # Runs on the hourly test trajectory (precompute_trajectory.py), not on
-    # the model's single-step triplet dataset.
-    if cfg.eval.plots.rollout:
-        print("Evaluating autoregressive rollout ...")
-        rollout_cfg = cfg.eval.rollout
+    # Both the rollout and the PSD run on the hourly test trajectory
+    # (precompute_trajectory.py), not on the model's single-step triplet dataset.
+    rollout_cfg = cfg.eval.rollout
+    if cfg.eval.plots.rollout or cfg.eval.plots.psd:
         dataset_rollout = DatasetRegistry.create(OmegaConf.create({
             "name": "era5_trajectory",
             "path": rollout_cfg.data_path,
@@ -164,6 +143,25 @@ def run_single(cfg: DictConfig, model_id: str | None = None) -> Path:
                 raise ValueError(f"Rollout trajectory '{stat}' differ from the model's training data; "
                                  f"re-run precompute_trajectory.py with --stats-from <training metadata.json>.")
 
+    # --- PSD, averaged over a fixed subset of rollout inits and all members ---
+    if cfg.eval.plots.psd:
+        print("Computing rollout PSD ...")
+        psd = compute_rollout_psd(
+            model,
+            dataset_rollout,
+            out_path=eval_dir / PSD_FILE,
+            n_inits=cfg.eval.psd.n_inits,
+            n_members=rollout_cfg.n_members,
+            leads=list(cfg.eval.psd.leads),
+            inits_per_batch=rollout_cfg.inits_per_batch,
+            num_workers=rollout_cfg.num_workers,
+        )
+        for kind in PSD_KINDS:
+            plot_psd_grid({base_id: psd}, kind, eval_dir / f"psd_{kind}{PLOT_TYPE}")
+
+    # --- Autoregressive ensemble rollout ------------------------------------
+    if cfg.eval.plots.rollout:
+        print("Evaluating autoregressive rollout ...")
         shard = tuple(rollout_cfg.shard) if rollout_cfg.get("shard", None) is not None else None
         rollout_dir = eval_dir / "rollout"
         df_rollout = evaluate_rollout(
