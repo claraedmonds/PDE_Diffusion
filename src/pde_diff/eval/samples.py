@@ -272,8 +272,9 @@ def plot_residuals_with_truth(
     residual_pred = residual_pred.detach().cpu().numpy()
     residual_true = residual_true.detach().cpu().numpy()
 
-    vmin = min(residual_pred.min(), residual_true.min()) if not limits else limits[0]
-    vmax = max(residual_pred.max(), residual_true.max()) if not limits else limits[1]
+    # nan-aware: the edge latitude rows are excluded from the residuals and padded with NaN
+    vmin = min(np.nanmin(residual_pred), np.nanmin(residual_true)) if not limits else limits[0]
+    vmax = max(np.nanmax(residual_pred), np.nanmax(residual_true)) if not limits else limits[1]
 
     nrows = 3 if show_difference else 2
 
@@ -302,8 +303,8 @@ def plot_residuals_with_truth(
 
     if show_difference:
         diff = np.abs(residual_pred - residual_true)
-        vmin_diff = diff.min() if not limits else limits[2]
-        vmax_diff = diff.max() if not limits else limits[3]
+        vmin_diff = np.nanmin(diff) if not limits else limits[2]
+        vmax_diff = np.nanmax(diff) if not limits else limits[3]
         im3 = ax3.imshow(diff.T, cmap="Oranges", extent=EXTENT_SUBSET, aspect="auto", vmin=vmin_diff, vmax=vmax_diff)
         ax3.set_title(rf"Residual difference $|\mathcal{{R}}_{{\mathrm{{{res_number}}}}}(\tilde{{\mathbf{{x}}}}_0) - \mathcal{{R}}_{{\mathrm{{{res_number}}}}}(\mathbf{{x}}_0)|$")
         plt.colorbar(im3, cax=cax_bot, label=res_unit)
@@ -344,10 +345,11 @@ def plot_recursive_residuals(
 
     diffs = [np.abs(p - t) for p, t in zip(residuals_pred, residuals_true)]
 
-    vmin = min(r.min() for r in residuals_pred + residuals_true) if not limits else limits[0]
-    vmax = max(r.max() for r in residuals_pred + residuals_true) if not limits else limits[1]
-    vmin_d = min(d.min() for d in diffs) if not limits else limits[2]
-    vmax_d = max(d.max() for d in diffs) if not limits else limits[3]
+    # nan-aware: the edge latitude rows are excluded from the residuals and padded with NaN
+    vmin = min(np.nanmin(r) for r in residuals_pred + residuals_true) if not limits else limits[0]
+    vmax = max(np.nanmax(r) for r in residuals_pred + residuals_true) if not limits else limits[1]
+    vmin_d = min(np.nanmin(d) for d in diffs) if not limits else limits[2]
+    vmax_d = max(np.nanmax(d) for d in diffs) if not limits else limits[3]
 
     n_steps = len(residuals_pred)
     fig = plt.figure(figsize=(10, 2.4 * n_steps / 5), constrained_layout=True)

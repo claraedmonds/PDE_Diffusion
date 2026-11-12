@@ -17,7 +17,7 @@ import pde_diff.loss  # registers loss classes
 from pde_diff.utils import DatasetRegistry
 from pde_diff.eval_primitives import PLOT_TYPE
 from pde_diff.eval.loading import find_best_fold, load_model_config, load_model, build_test_dataloader
-from pde_diff.eval.curves import plot_loss_curves, plot_residual_curves, plot_rollout_summary, summarize_rollout
+from pde_diff.eval.curves import plot_loss_curves, plot_residual_curves, plot_loss_components,plot_rollout_summary, summarize_rollout
 from pde_diff.eval.rollout import evaluate_rollout
 from pde_diff.eval.samples import plot_sample_target_absdiff_stacked
 from pde_diff.eval.psd import PSD_FILE, PSD_KINDS, compute_rollout_psd, plot_psd_grid
@@ -88,6 +88,9 @@ def run_single(cfg: DictConfig, model_id: str | None = None) -> Path:
     if cfg.eval.plots.residual_curves:
         print("Plotting per-residual validation curves ...")
         plot_residual_curves(base_id, model_cfg, eval_dir, fold_num=cfg.eval.model.fold_num)
+    if cfg.eval.plots.get("loss_components", True):
+        print("Plotting data vs physics loss components ...")
+        plot_loss_components(base_id, eval_dir, fold_num=cfg.eval.model.fold_num)
 
     pl.seed_everything(model_cfg.get("seed", 0))
     model = load_model(model_cfg, resolved_model_path)
@@ -163,7 +166,7 @@ def run_single(cfg: DictConfig, model_id: str | None = None) -> Path:
     if cfg.eval.plots.rollout:
         print("Evaluating autoregressive rollout ...")
         shard = tuple(rollout_cfg.shard) if rollout_cfg.get("shard", None) is not None else None
-        rollout_dir = eval_dir / "rollout"
+        rollout_dir = eval_dir / rollout_cfg.get("out_subdir", "rollout")
         df_rollout = evaluate_rollout(
             model,
             dataset_rollout,

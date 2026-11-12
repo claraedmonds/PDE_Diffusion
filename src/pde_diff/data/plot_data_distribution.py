@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 from pde_diff.utils import DatasetRegistry, LossRegistry
-from pde_diff.loss import VorticityLoss
+from pde_diff.loss import VorticityLoss, balance_ratio
 from tqdm import tqdm
 from omegaconf import OmegaConf
 import matplotlib.pyplot as plt
@@ -31,16 +31,21 @@ def to_tensor(x, device):
     return t.to(device, non_blocking=True)
 
 
-def append_hist(x, buf, max_samples: int):
+def append_hist(x, buf, max_samples: int, per_sample: int | None = None):
     """
-    Append flattened residual values to a Python list up to max_samples.
-    Prevents unbounded RAM usage on large datasets.
+    Append a random subsample of flattened residual values to a Python list,
+    up to max_samples in total. With `per_sample` set, at most that many
+    values are drawn from each call (i.e. each dataset sample), so the
+    histogram covers all timesteps / levels / grid points instead of only the
+    first sample. Prevents unbounded RAM usage on large datasets.
     """
     x = x.detach().flatten().cpu()
     if len(buf) >= max_samples:
         return
     remaining = max_samples - len(buf)
-    buf.extend(x[:remaining].tolist())
+    k = min(remaining, x.numel() if per_sample is None else per_sample)
+    idx = torch.randperm(x.numel())[:k]
+    buf.extend(x[idx].tolist())
 
 
 if __name__ == "__main__":
@@ -62,6 +67,7 @@ if __name__ == "__main__":
 
     # Cap number of samples to avoid excessive memory usage
     MAX_SAMPLES = 10_000
+    torch.manual_seed(0)
 
     if plot_residual_hists:
         cfg_loss = OmegaConf.create(
@@ -74,6 +80,8 @@ if __name__ == "__main__":
         loss_fn = LossRegistry.create(cfg_loss)
         dataset = DatasetRegistry.create(cfg)
         loss_fn.set_mean_and_std(dataset.means, dataset.stds, dataset.diff_means, dataset.diff_stds)
+        loss_fn.set_grid(dataset.grid_lat, dataset.grid_lon)
+        PER_SAMPLE = max(1, -(-MAX_SAMPLES // len(dataset)))  # ceil: spread the cap over all samples
 
         # Store raw (unnormalized) residual values for histograms
         hist_data = {
@@ -90,6 +98,10 @@ if __name__ == "__main__":
             "geostrophic_wind_relative_error_u": [],
             "geostrophic_wind_relative_error_v": []
         }
+        relative_wind_vector_hist = []
+        # Balance index B = mean|R| / mean(sum_k |term_k|) per residual (see loss.balance_ratio):
+        # 0 = the equation's terms cancel exactly, 1 = no cancellation at all.
+        balance_sums = {key: [0.0, 0.0, 0] for key in ("planetary_vorticity", "geostrophic_wind", "vorticity_divergence")}
         # Exact (uncapped) running mean/std, independent of the MAX_SAMPLES-capped hist_data
         residual_stats = {
             "geostrophic_wind": {"count": 0, "sum": 0.0, "sumsq": 0.0},
@@ -112,6 +124,15 @@ if __name__ == "__main__":
                 r_pv = loss_fn.compute_residual_planetary_vorticity(prev, curr, normalize=False)
                 r_vd = loss_fn.compute_residual_vorticity_divergence(prev, curr, normalize=False)
                 rel_gw = loss_fn.compute_residual_geostrophic_wind(prev, curr, normalize=False, relative=True)
+                rel_gw_vec = loss_fn.compute_residual_geostrophic_wind(prev, curr, normalize=False, relative="vector")
+
+                for key, fn in (("planetary_vorticity", loss_fn.compute_residual_planetary_vorticity),
+                                ("geostrophic_wind", loss_fn.compute_residual_geostrophic_wind),
+                                ("vorticity_divergence", loss_fn.compute_residual_vorticity_divergence)):
+                    num, den, n = balance_ratio(fn(prev, curr, return_terms=True))
+                    balance_sums[key][0] += num
+                    balance_sums[key][1] += den
+                    balance_sums[key][2] += n
 
                 # Compute residuals with noise (NOT normalized)
                 # use noisy prev/curr to inspect effect of noise
@@ -125,19 +146,21 @@ if __name__ == "__main__":
                     s["sum"] += r.sum().item()
                     s["sumsq"] += (r ** 2).sum().item()
 
-                append_hist(r_gw, hist_data["geostrophic_wind"], MAX_SAMPLES)
-                append_hist(r_pv, hist_data["planetary_vorticity"], MAX_SAMPLES)
-                append_hist(r_vd, hist_data["vorticity_divergence"], MAX_SAMPLES)
+                append_hist(r_gw, hist_data["geostrophic_wind"], MAX_SAMPLES, PER_SAMPLE)
+                append_hist(r_pv, hist_data["planetary_vorticity"], MAX_SAMPLES, PER_SAMPLE)
+                append_hist(r_vd, hist_data["vorticity_divergence"], MAX_SAMPLES, PER_SAMPLE)
 
-                append_hist(rel_gw[0],relative_wind_hist["geostrophic_wind_relative_error_u"],MAX_SAMPLES)
-                append_hist(rel_gw[1],relative_wind_hist["geostrophic_wind_relative_error_v"],MAX_SAMPLES)
+                append_hist(rel_gw[0],relative_wind_hist["geostrophic_wind_relative_error_u"], MAX_SAMPLES, PER_SAMPLE)
+                append_hist(rel_gw[1],relative_wind_hist["geostrophic_wind_relative_error_v"], MAX_SAMPLES, PER_SAMPLE)
+                append_hist(rel_gw_vec, relative_wind_vector_hist, MAX_SAMPLES, PER_SAMPLE)
 
-                append_hist(r_gw_noise, hist_data_noise["geostrophic_wind_noise"], MAX_SAMPLES)
-                append_hist(r_pv_noise, hist_data_noise["planetary_vorticity_noise"], MAX_SAMPLES)
-                append_hist(r_vd_noise, hist_data_noise["vorticity_divergence_noise"], MAX_SAMPLES)
+                append_hist(r_gw_noise, hist_data_noise["geostrophic_wind_noise"], MAX_SAMPLES, PER_SAMPLE)
+                append_hist(r_pv_noise, hist_data_noise["planetary_vorticity_noise"], MAX_SAMPLES, PER_SAMPLE)
+                append_hist(r_vd_noise, hist_data_noise["vorticity_divergence_noise"], MAX_SAMPLES, PER_SAMPLE)
 
                 del prev, curr, r_gw, r_pv, r_vd, prev_noise, curr_noise, r_gw_noise, r_pv_noise, r_vd_noise
 
+        # R2 is the signed (u_g - u, v_g - v), pooled over both components.
         results = {}
         for key, s in residual_stats.items():
             mean = s["sum"] / s["count"]
@@ -146,6 +169,16 @@ if __name__ == "__main__":
         args.out_json.parent.mkdir(parents=True, exist_ok=True)
         args.out_json.write_text(json.dumps(results, indent=2))
         print(f"Saved residual statistics to {args.out_json}")
+
+        # Balance index per residual: mean|R| / mean(sum of |terms|), in [0, 1].
+        balance = {}
+        for key, (num, den, n) in balance_sums.items():
+            balance[key] = {"balance_index": num / den, "mean_abs_residual": num / n, "mean_sum_abs_terms": den / n}
+            print(f"Balance index {key}: {num / den:.3f}  (mean|R| = {num / n:.3e}, mean sum|terms| = {den / n:.3e})")
+        balance_path = Path("reports/figures/era5_residual_balance.json")
+        balance_path.parent.mkdir(parents=True, exist_ok=True)
+        balance_path.write_text(json.dumps(balance, indent=2))
+        print(f"Saved residual balance indices to {balance_path}")
 
         # --- Plot 3 histograms side-by-side (counts, not normalized) ---
         fig, axes = plt.subplots(1, 3, figsize=(12, 2.5), sharey=True)
@@ -273,6 +306,29 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.savefig("reports/figures/era5_relative_geo_wind_residual_histograms.png", dpi=300)
         print("Saved histogram figure to reports/figures/era5_relative_geo_wind_residual_histograms.png")
+
+        # --- Vector form of the relative residual: |V - V_g| / (|V - V_g| + |V_g|) ---
+        fig, ax = plt.subplots(figsize=(4.5, 2.5))
+        data = np.asarray(relative_wind_vector_hist)
+        col = "#2A9D8F"
+        lo, hi = np.percentile(data, [0.5, 99.5])
+        mean, std = data.mean(), data.std()
+        ax.hist(data, bins=120, range=(lo, hi), histtype="stepfilled", alpha=0.6,
+                edgecolor="black", linewidth=0.8, color=col)
+        ax.axvline(mean, linestyle="-", linewidth=2, color=col)
+        ax.axvline(mean - std, linestyle="--", linewidth=1.5, color=col)
+        ax.axvline(mean + std, linestyle="--", linewidth=1.5, color=col)
+        ax.text(0.97, 0.97, f"Mean = {mean:.3e}\nStd  = {std:.3e}\nMedian = {np.median(data):.3e}",
+                transform=ax.transAxes, fontsize=10, verticalalignment="top", horizontalalignment="right",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.9))
+        ax.set_title(r"$\mathcal{R}_2$ Relative Residual, vector form", fontsize=12)
+        ax.set_xlabel(r"$|\mathbf{V}-\mathbf{V}_g|\,/\,(|\mathbf{V}-\mathbf{V}_g|+|\mathbf{V}_g|)$")
+        ax.set_ylabel("Count")
+        ax.set_xlim(lo, hi)
+        ax.grid(True, linestyle=":", alpha=0.6)
+        plt.tight_layout()
+        plt.savefig("reports/figures/era5_relative_geo_wind_vector_residual_histogram.png", dpi=300)
+        print("Saved histogram figure to reports/figures/era5_relative_geo_wind_vector_residual_histogram.png")
 
         # --- Plot 3 histograms side-by-side for noise (counts, not normalized) ---
         fig, axes = plt.subplots(1, 3, figsize=(12, 2.5), sharey=True)

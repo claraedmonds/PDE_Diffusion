@@ -15,6 +15,11 @@ save_dir: 'models/'
 loss:
   name: mse
   c_residual: 1e-1 #[vorticity loss (#1 planetary, #2 geostrophic wind, #3 vorticity-divergence)]
+  # How physics residuals enter the loss (see RESIDUAL_WEIGHTINGS in loss.py):
+  #   intrinsic      0.5 r^2 / (Sigma_t + sigma^2_ERA5)  (default; approximate physics)
+  #   bastek         0.5 r^2 / Sigma_t                    (Bastek et al., exact physics)
+  #   bastek_clamped legacy clamped version (reproduces runs before 2026-11-06)
+  residual_weighting: intrinsic
 
 model:
   name: unet3d_conditional

@@ -7,7 +7,10 @@ import torch
 from omegaconf import OmegaConf
 
 from pde_diff.data.datasets import TrajectoryDataset, select_init_indices
+from pde_diff.eval.curves import plot_rollout_summary
+from pde_diff.eval.psd import compute_rollout_psd, plot_psd_grid
 from pde_diff.eval.rollout import Normalizer, crps_metric, evaluate_rollout, load_rollout_metrics, rollout_ensemble
+from pde_diff.eval_primitives import PLOT_TYPE
 from pde_diff.utils import init_means_and_stds_era5
 
 VARS = ["u", "v", "pv", "t", "z"]
@@ -41,8 +44,8 @@ def _write_store(path, times, seed=0):
     meta = {
         "atmospheric_features": VARS,
         "pressure_levels": LEVELS,
-        "grid_lon": np.linspace(0, 359, N_LON).tolist(),
-        "grid_lat": np.linspace(70, 46, N_LAT).tolist(),
+        "grid_lon": (-180.0 + 0.75 * np.arange(N_LON)).tolist(),  # real downsampled ERA5 grid
+        "grid_lat": (70.0 - 0.75 * np.arange(N_LAT)).tolist(),
         "means": means.tolist(), "stds": stds.tolist(),
         "diff_means": diff_means.tolist(), "diff_stds": diff_stds.tolist(),
     }
@@ -141,10 +144,19 @@ def test_oracle_rollout_reproduces_truth(tmp_path):
                           n_error_dist_inits=0, num_workers=0)
     mse = df[(df.metric == "mse") & (df.member == "member_mean") & (df.variable == "all")]
     assert mse["value"].max() < 1e-6
-    for name in ["R1_planetary_vorticity", "R2_geostrophic_wind", "R3_vorticity_divergence"]:
-        pred = df[(df.metric == name) & (df.member == "member_mean")].sort_values(["init_time", "lead_h"])
-        true = df[(df.metric == name) & (df.member == "truth")].sort_values(["init_time", "lead_h"])
+    for name in ["R1_planetary_vorticity", "R2_geostrophic_wind", "R3_vorticity_divergence",
+                 "B_geo", "B_pv", "B_vd", "ageo_frac"]:
+        pred = df[(df.metric == name) & (df.member == "member_mean")].sort_values(["init_time", "lead_h", "level"])
+        true = df[(df.metric == name) & (df.member == "truth")].sort_values(["init_time", "lead_h", "level"])
+        assert len(pred) > 0
         np.testing.assert_allclose(pred["value"].values, true["value"].values, rtol=1e-3)
+    balance = df[df.metric.isin(["B_geo", "B_pv", "B_vd", "ageo_frac"])]["value"]
+    assert balance.between(0, 1).all()
+    assert set(df[(df.metric == "B_geo") & (df.variable == "by_level")]["level"]) == {"450", "500", "550"}
+
+    plot_rollout_summary(df, tmp_path / "curves", var_names=VARS)
+    assert (tmp_path / "curves" / f"B_geo{PLOT_TYPE}").exists()
+    assert (tmp_path / "curves" / f"B_geo_500{PLOT_TYPE}").exists()
     persistence = df[(df.metric == "mse") & (df.member == "persistence") & (df.variable == "all")]
     assert persistence["value"].min() > 0
 
@@ -162,3 +174,18 @@ def test_evaluate_rollout_resumes(tmp_path):
     assert len(load_rollout_metrics(tmp_path / "out")) == len(first)
     evaluate_rollout(model, ds, tmp_path / "out", shard=(1, 2), **kwargs)
     assert set(load_rollout_metrics(tmp_path / "out")["init_time"]) == {ds.init_time(k) for k in range(len(ds))}
+
+
+def test_oracle_wind_decomposition_psd(tmp_path):
+    """Geostrophic / ageostrophic wind spectra: an oracle forecast matches the
+    truth, and an old PSD file without them is recomputed, not reused."""
+    times = _hourly("2023-01-01T00", 40)
+    _write_store(tmp_path / "store", times)
+    ds = TrajectoryDataset(OmegaConf.create({"path": str(tmp_path / "store"), "horizon": 2, "init_stride": 12}))
+    out = tmp_path / "psd.npz"
+    np.savez(out, n_inits=2, n_members=1, leads=[1, 2], level_idx=1)  # stale file from before the wind kinds
+    psd = compute_rollout_psd(OracleModel(ds), ds, out, n_inits=2, n_members=1, leads=[1, 2], num_workers=0)
+    for kind in ("geo", "ageo"):
+        assert psd[f"pred_{kind}"].shape == psd[f"true_{kind}"].shape == (2, 2, len(psd["wavelength_km"]))
+        np.testing.assert_allclose(psd[f"pred_{kind}"], psd[f"true_{kind}"], rtol=1e-2)
+        assert plot_psd_grid({"oracle": psd}, kind, tmp_path / f"psd_{kind}.png").exists()

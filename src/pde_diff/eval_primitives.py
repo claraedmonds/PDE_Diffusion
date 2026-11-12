@@ -255,10 +255,13 @@ def plot_training_metrics(model_id, out_dir=None):
     save_dir = Path(out_dir) if out_dir is not None else Path("./reports/figures") / model_id
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    # DiffusionModel logs the p2-weighted MSE as "val_mse_(weighted)"; older
+    # runs may have plain "val_mse".
+    val_mse_col = "val_mse_(weighted)" if "val_mse_(weighted)" in df.columns else "val_mse"
     metrics = [
         ("train_loss", True, "Train Loss vs Epoch"),
         ("val_loss", True, "Validation Loss vs Epoch"),
-        ("val_mse", False, "Validation MSE vs Epoch"),
+        (val_mse_col, False, "Validation MSE vs Epoch"),
     ]
 
     for col, logy, title in metrics:
@@ -279,10 +282,10 @@ def plot_training_metrics(model_id, out_dir=None):
         ax.figure.savefig(save_dir / f"{col}{PLOT_TYPE}", dpi=150)
         plt.close(ax.figure)
 
-    if {"val_loss", "val_mse"}.issubset(df.columns):
-        sub = df[["epoch", "val_loss", "val_mse"]].dropna()
+    if {"val_loss", val_mse_col}.issubset(df.columns):
+        sub = df[["epoch", "val_loss", val_mse_col]].dropna()
         if not sub.empty:
-            ax = sub.plot(x="epoch", y=["val_loss", "val_mse"], figsize=(8, 4.5))
+            ax = sub.plot(x="epoch", y=["val_loss", val_mse_col], figsize=(8, 4.5))
             ax.set_title("Validation Metrics vs Epoch")
             ax.set_xlabel("Epoch")
             ax.set_ylabel("Value")

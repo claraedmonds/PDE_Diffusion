@@ -35,6 +35,8 @@ def train(cfg: DictConfig):
             model.loss_fn.set_mean_and_std(
                 dataset.means, dataset.stds, dataset.diff_means, dataset.diff_stds
             )
+    if cfg.loss.name == 'vorticity' and hasattr(dataset, 'grid_lat'):
+        model.loss_fn.set_grid(dataset.grid_lat, dataset.grid_lon)
 
     if ckpt_path:=cfg.model.get("ckpt_path", None):
         # load weight parameters

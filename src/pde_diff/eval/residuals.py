@@ -26,4 +26,6 @@ def build_residual_evaluator(dataset, device) -> VorticityLoss:
     Normalization stats come from `dataset`."""
     loss_fn = VorticityLoss(OmegaConf.create({"name": "vorticity", "c_residual": 0.0, "device": str(device)}))
     loss_fn.set_mean_and_std(dataset.means, dataset.stds, dataset.diff_means, dataset.diff_stds)
+    if hasattr(dataset, "grid_lat"):
+        loss_fn.set_grid(dataset.grid_lat, dataset.grid_lon)
     return loss_fn

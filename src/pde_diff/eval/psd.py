@@ -18,12 +18,30 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from pde_diff.eval.palette import get_model_color
+import einops as ein
+
+from pde_diff.eval.residuals import build_residual_evaluator
 from pde_diff.eval.rollout import Normalizer, rollout_ensemble, QUALITATIVE_LEVEL_IDX
 
 EARTH_RADIUS_KM = 6371.0088
 DEG_TO_KM = np.pi / 180.0 * EARTH_RADIUS_KM  # ~111.32 km/deg
 PSD_FILE = "psd_rollout.npz"
-PSD_KINDS = {"change": "1 h change", "state": "state"}
+PSD_KINDS = {"change": "1 h change", "state": "state",
+             "geo": "geostrophic wind V_g", "ageo": "ageostrophic wind V - V_g"}
+WIND_KINDS = ("geo", "ageo")  # columns: u, v components (see wind_decomposition)
+
+
+def wind_decomposition(residual_fn, states: torch.Tensor, n_levels: int, level_idx: int, var_names: list[str]):
+    """Geostrophic (u_g, v_g) and ageostrophic (u - u_g, v - v_g) wind of raw
+    states (..., C, lon, lat) at `level_idx`, with the same QG V_g as R2.
+    Returns two tensors (..., 2, lon, lat)."""
+    lead_shape = states.shape[:-3]
+    x = ein.rearrange(states.flatten(0, -4), "n (var lev) lon lat -> n lev var lon lat", lev=n_levels)
+    u, v, z = (x[:, :, var_names.index(name)] for name in ("u", "v", "z"))
+    u_g, v_g = residual_fn.geostrophic_wind(z)
+    geo = torch.stack([u_g, v_g], dim=1)[:, :, level_idx]
+    ageo = torch.stack([u - u_g, v - v_g], dim=1)[:, :, level_idx]
+    return geo.view(*lead_shape, *geo.shape[1:]), ageo.view(*lead_shape, *ageo.shape[1:])
 
 
 def radial_psd(fields: np.ndarray, dx_km: float) -> tuple[np.ndarray, np.ndarray]:
@@ -110,12 +128,14 @@ def compute_rollout_psd(
     out_path = Path(out_path)
     if out_path.exists():
         saved = load_psd(out_path)
-        if all(np.array_equal(saved.get(key), val) for key, val in settings.items()):
+        has_all_kinds = all(f"{who}_{kind}" in saved for who in ("pred", "true") for kind in PSD_KINDS)
+        if has_all_kinds and all(np.array_equal(saved.get(key), val) for key, val in settings.items()):
             print(f"Reusing PSD in {out_path}")
             return saved
 
     device = model.device
     norm = Normalizer(dataset, device)
+    residual_fn = build_residual_evaluator(dataset, device)
     var_names = list(dataset.atmospheric_features)
     n_levels = len(dataset.pressure_levels)
     channels = [j * n_levels + level_idx for j in range(len(var_names))]
@@ -142,6 +162,9 @@ def compute_rollout_psd(
             "true_state": true_states[:, lead_idx][..., channels, :, :],                    # (B, L, V, lon, lat)
             "true_change": (true_states - true_prev)[:, lead_idx][..., channels, :, :],
         }
+        for who, states in (("pred", pred_states[:, :, lead_idx].flatten(0, 1)), ("true", true_states[:, lead_idx])):
+            fields[f"{who}_geo"], fields[f"{who}_ageo"] = wind_decomposition(residual_fn, states, n_levels, level_idx,
+                                                                             var_names)
         for key, val in fields.items():
             k_centres, psd = radial_psd(val.cpu().numpy(), dx_km)
             sums[key] = sums[key] + psd.sum(0)
@@ -150,6 +173,7 @@ def compute_rollout_psd(
 
     result = {key: val / (n_pred if key.startswith("pred") else n_true) for key, val in sums.items()}
     result.update(settings, wavelength_km=1.0 / k_centres[1:], var_names=np.array(var_names),
+                  **{f"var_names_{kind}": np.array(["u", "v"]) for kind in WIND_KINDS},
                   level=str(int(dataset.pressure_levels[level_idx])),
                   init_times=np.array([dataset.init_time(k) for k in indices]))
     for key in sums:  # drop the DC bin, as for wavelength_km
@@ -170,13 +194,20 @@ def plot_psd_grid(psd_by_model: dict[str, dict], kind: str, out_path: Path) -> P
     """One figure of mean PSDs (rows = leads, columns = variables) for one or
     more models' `compute_rollout_psd` results, with ERA5 truth in black.
     `kind` is "change" or "state". All models must share the same inits."""
+    missing = [label for label, psd in psd_by_model.items() if f"pred_{kind}" not in psd]
+    if missing:
+        print(f"No '{kind}' PSD for {missing} (saved before it existed); leaving them out of this plot.")
+    psd_by_model = {label: psd for label, psd in psd_by_model.items() if label not in missing}
+    if not psd_by_model:
+        return None
     labels = list(psd_by_model)
     ref = psd_by_model[labels[0]]
     for label in labels[1:]:
         if not np.array_equal(psd_by_model[label]["init_times"], ref["init_times"]):
             print(f"Warning: {label} PSD uses different inits than {labels[0]}; truth curve is from {labels[0]}.")
 
-    leads, var_names = list(ref["leads"]), [str(v) for v in ref["var_names"]]
+    leads = list(ref["leads"])
+    var_names = [str(v) for v in ref.get(f"var_names_{kind}", ref["var_names"])]
     fig, axes = plt.subplots(len(leads), len(var_names), figsize=(4 * len(var_names), 3.3 * len(leads)),
                              squeeze=False)
     for i, lead in enumerate(leads):

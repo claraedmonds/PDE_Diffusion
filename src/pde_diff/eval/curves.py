@@ -123,6 +123,120 @@ def plot_residual_curves(
     print(f"Saved: {save_path}")
 
 
+# Short residual key (as logged by PDE_loss) -> display name / colour index
+# (colour index matches RESIDUAL_COLUMNS so both plots use the same colours).
+LOSS_COMPONENT_NAMES = {"pv": ("planetary vorticity", 0), "geo": ("geostrophic wind", 1), "vd": ("vorticity divergence", 2)}
+
+
+def _fold_mean(dfs: list[pd.DataFrame], col: str):
+    """Epoch-wise mean of `col` over runs (folds); None if no run logged it."""
+    series = [df[["epoch", col]].dropna().groupby("epoch")[col].mean() for df in dfs if col in df.columns]
+    series = [s for s in series if not s.empty]
+    if not series:
+        return None
+    mean = pd.concat(series, axis=1).dropna().mean(axis=1)
+    return mean if not mean.empty else None
+
+
+def plot_loss_components(model_id: str, out_dir: Path, fold_num: int | None = None, log_path: str = "logs") -> None:
+    """Data vs physics loss breakdown per split (train/val): one figure per
+    split with (a) the magnitude of each term as it enters the total loss,
+    (b, legacy "bastek_clamped" weighting only) the fraction of residual elements at the log-likelihood clamp (zero
+    gradient), and (c, train only) the gradient norm of each term w.r.t. the
+    network output. Needs the `<split>_data_loss` / `<split>_phys_*` /
+    `<split>_gradnorm_*` columns logged by DiffusionModel; averaged over folds
+    when `fold_num` is set. Saved to `out_dir`/loss_curves/."""
+    model_ids = [model_id] if not fold_num else [f"{model_id}-{f}" for f in range(1, fold_num + 1)]
+    dfs = [df for df in (_read_metrics(mid, log_path=log_path) for mid in model_ids) if df is not None]
+    if not dfs:
+        print(f"  No metrics.csv found for {model_id}; skipping loss-component plot.")
+        return
+
+    save_dir = Path(out_dir) / "loss_curves"
+    cmap = plt.get_cmap("tab10")
+    all_cols = set().union(*(df.columns for df in dfs))
+
+    def residual_keys(prefix):
+        keys = sorted({c[len(prefix):] for c in all_cols if c.startswith(prefix)} - {"total"})
+        return keys
+
+    def label_color(key):
+        name, idx = LOSS_COMPONENT_NAMES.get(key, (key, 3 + len(key)))
+        return name, cmap(idx)
+
+    for split in ("train", "val"):
+        data = _fold_mean(dfs, f"{split}_data_loss")
+        if data is None:
+            print(f"  No '{split}_data_loss' column for {model_id} (run predates loss-component logging); skipping.")
+            continue
+
+        phys_keys = residual_keys(f"{split}_phys_loss_")
+        clamp_keys = residual_keys(f"{split}_phys_clamp_frac_")
+        grad_data = _fold_mean(dfs, f"{split}_gradnorm_data")
+        has_grad = grad_data is not None
+
+        has_clamp = bool(clamp_keys)  # only the legacy "bastek_clamped" weighting logs this
+        ncols = 1 + has_clamp + has_grad
+        fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols, 4.2), squeeze=False)
+        axes = axes[0]
+        clamp_idx, grad_idx = 1, 1 + has_clamp
+
+        # (a) loss magnitudes
+        ax = axes[0]
+        ax.plot(data.index, data.values, color="black", label="data (p2-weighted MSE)")
+        for key in phys_keys:
+            s = _fold_mean(dfs, f"{split}_phys_loss_{key}")
+            if s is not None:
+                name, color = label_color(key)
+                ax.plot(s.index, s.values, color=color, label=name)
+        total = _fold_mean(dfs, f"{split}_phys_loss_total")
+        if total is not None and len(phys_keys) > 1:
+            ax.plot(total.index, total.values, color="grey", ls="--", label="physics total")
+        ax.set_yscale("log")
+        ax.set_title("Loss term magnitude (as weighted in total)")
+        ax.set_ylabel("Loss contribution")
+
+        # (b) clamp fraction (legacy "bastek_clamped" weighting only)
+        if has_clamp:
+            ax = axes[clamp_idx]
+            for key in clamp_keys:
+                s = _fold_mean(dfs, f"{split}_phys_clamp_frac_{key}")
+                if s is not None:
+                    name, color = label_color(key)
+                    ax.plot(s.index, s.values, color=color, label=name)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_title("Fraction of residual elements clamped\n(zero gradient)")
+            ax.set_ylabel("Fraction")
+
+        # (c) gradient norms w.r.t. model output (train only)
+        if has_grad:
+            ax = axes[grad_idx]
+            ax.plot(grad_data.index, grad_data.values, color="black", label="data")
+            for key in residual_keys(f"{split}_gradnorm_phys_"):
+                s = _fold_mean(dfs, f"{split}_gradnorm_phys_{key}")
+                if s is not None:
+                    name, color = label_color(key)
+                    ax.plot(s.index, s.values, color=color, label=name)
+            ax.set_yscale("log")
+            ax.set_title("‖∂term/∂model_out‖")
+            ax.set_ylabel("Gradient norm")
+
+        for ax in axes:
+            ax.set_xlabel("Epoch")
+            ax.grid(True, alpha=0.3)
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend(frameon=True, fancybox=True, framealpha=0.9, fontsize=8)
+        fold_note = f" (mean over {len(dfs)} folds)" if len(dfs) > 1 else ""
+        fig.suptitle(f"{split} loss components — {model_id}{fold_note}")
+        fig.tight_layout()
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / f"{split}_loss_components{PLOT_TYPE}"
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {save_path}")
+
+
 # Display style per `member` value of the rollout metric rows.
 MEMBER_STYLES = {
     "member_mean": dict(label="Forecast (member mean)", color="C0", ls="-", marker="o"),
@@ -190,6 +304,15 @@ def summarize_rollout(df: pd.DataFrame) -> pd.DataFrame:
     return out.drop(columns="std")
 
 
+# Balance metrics written by the "balance" rollout metric (see rollout.balance_metric).
+BALANCE_PLOTS = {
+    "B_geo": "Geostrophic balance index B (R2)",
+    "B_pv": "QG PV balance index B (R1)",
+    "B_vd": "Vorticity balance index B (R3)",
+    "ageo_frac": "Ageostrophic fraction |V-V_g|/(|V-V_g|+|V_g|)",
+}
+
+
 def plot_rollout_summary(df: pd.DataFrame, out_dir: Path, var_names: list[str], level: str = "500") -> None:
     """Standard set of rollout plots: MSE (overall and per variable at
     `level`), R1-R3 residuals against the ERA5 reference, CRPS, spread vs
@@ -205,6 +328,12 @@ def plot_rollout_summary(df: pd.DataFrame, out_dir: Path, var_names: list[str], 
     for name, _, _ in RESIDUALS:
         plots.append((dict(curves=[(name, "member_mean"), (name, "truth")], ylabel=f"mean |{name.split('_')[0]}| (normalised)",
                            title=name.replace("_", " ")), name))
+    for name, label in BALANCE_PLOTS.items():
+        plots.append((dict(curves=[(name, "member_mean"), (name, "truth")], ylabel=label,
+                           title=f"{label}: forecast vs ERA5"), name))
+        for lev in sorted(df.loc[(df["metric"] == name) & (df["variable"] == "by_level"), "level"].unique()):
+            plots.append((dict(curves=[(name, "member_mean"), (name, "truth")], variable="by_level", level=lev,
+                               ylabel=label, title=f"{label} at {lev} hPa: forecast vs ERA5"), f"{name}_{lev}"))
     for var in var_names:
         plots.append((dict(curves=[("mse", "member_mean"), ("mse", "ens_mean"), ("mse", "persistence")],
                            variable=var, level=level, ylabel="MSE (normalised)"), f"mse_{var}{level}"))

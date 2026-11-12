@@ -20,8 +20,8 @@ eval:
     type: test               # test | ood (used only for output-dir naming)
     # Held-out year range to slice out of the model's own precomputed
     # inputs.npy/targets.npy blob (era5_precomputed only). Required.
-    min_year: null
-    max_year: null
+    min_year: 2023
+    max_year: 2024
 
   # --- autoregressive rollout (hourly test trajectory, see precompute_trajectory.py) ---
   rollout:
@@ -32,15 +32,22 @@ eval:
     init_times: null          # explicit init datetimes, overriding the stride (e.g. ["2023-01-15T00"])
     n_members: 9              # ensemble members (independent diffusion samples) per init
     inits_per_batch: 1        # inits rolled out together; batch size = inits_per_batch * n_members
-    metrics: [mse, residuals, spread, crps, persistence, rmse]
+    metrics: [mse, residuals, balance, spread, crps, persistence, rmse]
+    out_subdir: rollout       # folder in the eval dir; use a new one to re-run metrics (inits already in its CSV are skipped)
     shard: null               # [i, n]: run every n-th init starting at i (for SLURM array jobs)
     num_workers: 4
+
+  # --- PSD: mean over a fixed, evenly spaced subset of rollout inits x all n_members ---
+  psd:
+    n_inits: 50               # same subset for every model (depends only on the trajectory's init count)
+    leads: [1, 6, 12]         # lead times (h) to plot; leads beyond rollout.horizon are dropped
 
   # --- plot-group enable/disable flags ---
   plots:
     loss_curves: true
     residual_curves: true       # validation-only per-residual curves, scaled by c_residual
-    psd: true                    # single 5-subplot PSD comparison figure
+    loss_components: true       # data vs physics loss magnitude, clamp fraction, grad norms (train/val)
+    psd: true                    # rollout PSD of state and 1 h change (see eval.psd), saved to psd_rollout.npz
     rollout: true
     error_distributions: true
     sample_grids: true

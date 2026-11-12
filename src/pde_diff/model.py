@@ -66,8 +66,16 @@ class DiffusionModel(pl.LightningModule):
         self.loss_fn.c_data = self.scheduler.p2_loss_weight[steps] #https://arxiv.org/pdf/2303.09556.pdf
         loss = self.loss_fn(model_out=model_out, target=state, x0_hat=x0_hat, var=variance)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self._log_loss_components("train", batch_size=model_out.size(0))
         self.additional_validation_metrics(model_out, state, x0_hat, steps, validation=False)
         return loss
+
+    def _log_loss_components(self, split, batch_size):
+        """Log the data/physics loss breakdown recorded by the loss function's
+        last forward() (data_loss, phys_loss_<r>, phys_clamp_frac_<r>,
+        gradnorm_<term>) as `<split>_<key>` epoch averages."""
+        for key, value in getattr(self.loss_fn, "last_components", {}).items():
+            self.log(f"{split}_{key}", value, on_step=False, on_epoch=True, batch_size=batch_size)
 
     def validation_step(self, batch, batch_idx):
         if self.conditional:
@@ -91,6 +99,7 @@ class DiffusionModel(pl.LightningModule):
         self.loss_fn.c_data = self.scheduler.p2_loss_weight[steps]
         loss = self.loss_fn(model_out=model_out, target=target, x0_hat=x0_hat, var=variance)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self._log_loss_components("val", batch_size=model_out.size(0))
         self.additional_validation_metrics(model_out, target, x0_hat, steps)
 
     def test_step(self, batch, batch_idx):
@@ -116,6 +125,7 @@ class DiffusionModel(pl.LightningModule):
         self.loss_fn.c_data = self.scheduler.p2_loss_weight[steps]
         loss = self.loss_fn(model_out=model_out, target=target, x0_hat=x0_hat, var=variance)
         self.log("test_loss", loss, prog_bar=True, batch_size=model_out.size(0))
+        self._log_loss_components("test", batch_size=model_out.size(0))
         self.additional_validation_metrics(model_out, target,x0_hat, steps)
 
     def additional_validation_metrics(self, model_out, target, x0_hat, steps, validation=True):

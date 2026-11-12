@@ -24,6 +24,7 @@ ROLLOUT_COMPARISONS = [
     ("crps", "ens", None),
     ("spread", "ens", None),
     *[(name, "member_mean", "truth") for name, _, _ in RESIDUALS],
+    *[(name, "member_mean", "truth") for name in ("B_geo", "B_pv", "B_vd", "ageo_frac")],
 ]
 
 
@@ -136,11 +137,11 @@ def run_comparison(cfg: DictConfig, run_single_fn: Callable[[DictConfig, str], P
         display_name = labels.get(model_id, model_id)
         resolved_model_ids.append(best_fold_id)
 
-        rollout_dir = Path(cfg.eval.output_dir) / f"{best_fold_id}_eval" / "rollout"
+        rollout_dir = Path(cfg.eval.output_dir) / f"{best_fold_id}_eval" / cfg.eval.rollout.get("out_subdir", "rollout")
         df = load_rollout_metrics(rollout_dir)
         if df is None and cfg.eval.compare.get("rerun_missing", True):
             print(f"No rollout metrics found for {model_id}; running single-model eval first.")
-            rollout_dir = run_single_fn(cfg, model_id) / "rollout"
+            rollout_dir = run_single_fn(cfg, model_id) / cfg.eval.rollout.get("out_subdir", "rollout")
             df = load_rollout_metrics(rollout_dir)
         psd_path = rollout_dir.parent / PSD_FILE
         if psd_path.exists():

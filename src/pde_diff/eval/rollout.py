@@ -33,7 +33,7 @@ from pde_diff.eval.samples import (
 
 METRICS_FILE_STEM = "rollout_metrics"
 COLUMNS = ["init_time", "lead_h", "metric", "variable", "level", "member", "value"]
-DEFAULT_METRICS = ["mse", "residuals", "spread", "crps", "persistence", "rmse"]
+DEFAULT_METRICS = ["mse", "residuals", "balance", "spread", "crps", "persistence", "rmse"]
 QUALITATIVE_LEVEL_IDX = 1  # 500 hPa
 
 # (row metric name, VorticityLoss method, short name used by the residual plotters)
@@ -98,11 +98,14 @@ def rollout_ensemble(model, cond, target_clock, n_members: int, norm: Normalizer
 
 def residual_fields(residual_fn, prev_norm, change_norm) -> dict[str, torch.Tensor]:
     """|R1|, |R2|, |R3| fields (normalised residual units) for a batch of
-    normalised previous states and normalised changes, each (N, C, lon, lat)."""
-    return {
-        name: getattr(residual_fn, method)(x0_previous=prev_norm, x0_change_pred=change_norm, normalize=True).abs()
-        for name, method, _ in RESIDUALS
-    }
+    normalised previous states and normalised changes, each (N, C, lon, lat).
+    R2 is a vector (N, 2, lev, lon, lat); its field is the magnitude
+    |V_g - V| / rms, shaped (N, lev, lon, lat) like R3."""
+    out = {}
+    for name, method, _ in RESIDUALS:
+        r = getattr(residual_fn, method)(x0_previous=prev_norm, x0_change_pred=change_norm, normalize=True)
+        out[name] = r.norm(dim=1) if r.dim() == 5 else r.abs()
+    return out
 
 
 @dataclass
@@ -220,6 +223,73 @@ def residual_metric(ctx: RolloutContext) -> list[dict]:
             rows += ctx.rows(name, str(m), overall=pred_vals[name][:, m])
         rows += ctx.rows(name, "member_mean", overall=pred_vals[name].mean(1))
         rows += ctx.rows(name, "truth", overall=true_vals[name])
+    return rows
+
+
+BALANCE_RESIDUALS = [
+    ("B_geo", "compute_residual_geostrophic_wind"),
+    ("B_pv", "compute_residual_planetary_vorticity"),
+    ("B_vd", "compute_residual_vorticity_divergence"),
+]
+
+
+def balance_per_sample(term_groups) -> tuple[torch.Tensor, torch.Tensor]:
+    """Balance index B = sum|R| / sum(sum_k |term_k|) per sample (see
+    loss.balance_ratio), for term groups shaped (N, ...). Returns (B over
+    everything, B per level), each (N,) / (N, lev); per level is None for
+    residuals without a level axis (R1)."""
+    num = sum(sum(group).abs() for group in term_groups)
+    den = sum(sum(t.abs() for t in group) for group in term_groups)
+    total = num.flatten(1).sum(1) / den.flatten(1).sum(1)
+    per_level = num.sum((-2, -1)) / den.sum((-2, -1)) if num.dim() == 4 else None
+    return total, per_level
+
+
+def balance_fields(residual_fn, prev_norm, change_norm) -> dict[str, tuple]:
+    """Balance indices and the vector ageostrophic fraction
+    |V - V_g| / (|V - V_g| + |V_g|) (grid mean, per level) of one batch of
+    normalised previous states and changes, each (N, C, lon, lat)."""
+    out = {name: balance_per_sample(getattr(residual_fn, method)(prev_norm, change_norm, return_terms=True))
+           for name, method in BALANCE_RESIDUALS}
+    rel = residual_fn.compute_residual_geostrophic_wind(prev_norm, change_norm, relative="vector")  # (N, lev, lon, lat)
+    out["ageo_frac"] = (rel.flatten(1).mean(1), rel.mean((-2, -1)))
+    return out
+
+
+@register_metric("balance")
+def balance_metric(ctx: RolloutContext) -> list[dict]:
+    """Balance indices B_geo (R2), B_pv (R1), B_vd (R3) and the vector
+    ageostrophic fraction per lead, on every member and on the ERA5 truth.
+    B in [0, 1]; 0 = terms cancel exactly. A forecast whose B_geo rises above
+    the truth's along the rollout is drifting out of geostrophic balance.
+    Overall rows use variable/level "all"; per-level rows (residuals with a
+    level axis) use variable "by_level" and the pressure level."""
+    B, M, H = ctx.pred_states.shape[:3]
+    levels = list(dict.fromkeys(lev for _, lev in ctx.channel_names))
+    pred_prev = ctx.norm.norm_state(ctx.pred_prev_states)
+    true_prev = ctx.norm.norm_state(ctx.true_prev_states)
+
+    pred_tot, pred_lev, true_tot, true_lev = {}, {}, {}, {}
+    for k in range(H):
+        pred = balance_fields(ctx.residual_fn, pred_prev[:, :, k].flatten(0, 1), ctx.pred_changes[:, :, k].flatten(0, 1))
+        true = balance_fields(ctx.residual_fn, true_prev[:, k], ctx.true_changes_norm[:, k])
+        for name in pred:
+            pred_tot.setdefault(name, torch.zeros(B, M, H))[:, :, k] = pred[name][0].view(B, M).cpu()
+            true_tot.setdefault(name, torch.zeros(B, H))[:, k] = true[name][0].cpu()
+            if pred[name][1] is not None:
+                L = pred[name][1].shape[-1]
+                pred_lev.setdefault(name, torch.zeros(B, M, H, L))[:, :, k] = pred[name][1].view(B, M, L).cpu()
+                true_lev.setdefault(name, torch.zeros(B, H, L))[:, k] = true[name][1].cpu()
+
+    rows = []
+    for name in pred_tot:
+        for m in range(M):
+            rows += ctx.rows(name, str(m), overall=pred_tot[name][:, m])
+        rows += ctx.rows(name, "member_mean", overall=pred_tot[name].mean(1))
+        rows += ctx.rows(name, "truth", overall=true_tot[name])
+        for i, lev in enumerate(levels if name in pred_lev else []):
+            rows += ctx.rows(name, "member_mean", overall=pred_lev[name][:, :, :, i].mean(1), variable="by_level", level=lev)
+            rows += ctx.rows(name, "truth", overall=true_lev[name][:, :, i], variable="by_level", level=lev)
     return rows
 
 
@@ -352,7 +422,8 @@ def plot_qualitative(ctx: RolloutContext, b: int, sample_idx: int, out_dir: Path
     pred = residual_fields(ctx.residual_fn, ctx.norm.norm_state(ctx.pred_prev_states[b, 0]), ctx.pred_changes[b, 0])
     true = residual_fields(ctx.residual_fn, ctx.norm.norm_state(ctx.true_prev_states[b]), ctx.true_changes_norm[b])
     for name, _, short in RESIDUALS:
-        p, t = pred[name].cpu(), true[name].cpu()
+        # residuals exclude the edge latitude rows; pad them back (blank) so the maps keep the full extent
+        p, t = (ctx.residual_fn.pad_edge_rows(x).cpu() for x in (pred[name], true[name]))
         if p.dim() == 4:  # (H, lev, lon, lat): R2, R3 are per level
             p, t = p[:, level_idx], t[:, level_idx]
         plot_residuals_with_truth(p[0], t[0], short, sample_idx=sample_idx, dir=sample_dir)
